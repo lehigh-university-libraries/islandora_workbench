@@ -57,84 +57,40 @@ class SimpleField:
             text_format = config["text_format_id"]
 
         id_field = row.get(config.get("id_field", "not_applicable"), "not_applicable")
-        # Cardinality is unlimited.
-        if field_definitions[field_name]["cardinality"] == -1:
-            if config["subdelimiter"] in row[field_name]:
-                field_values = []
-                subvalues = row[field_name].split(config["subdelimiter"])
-                subvalues = self.remove_invalid_values(
-                    config, field_definitions, field_name, subvalues
+        field_values = []
+        subvalues = row[field_name].split(config["subdelimiter"])
+        subvalues = self.remove_invalid_values(
+            config, field_definitions, field_name, subvalues
+        )
+        subvalues = self.dedupe_values(subvalues)
+        if field_definitions[field_name]["cardinality"] != -1:
+            if len(subvalues) > int(field_definitions[field_name]["cardinality"]):
+                log_field_cardinality_violation(
+                    field_name,
+                    id_field,
+                    field_definitions[field_name]["cardinality"],
                 )
-                subvalues = self.dedupe_values(subvalues)
-                for subvalue in subvalues:
-                    subvalue = truncate_csv_value(
-                        field_name, id_field, field_definitions[field_name], subvalue
-                    )
-                    if (
-                        "formatted_text" in field_definitions[field_name]
-                        and field_definitions[field_name]["formatted_text"] is True
-                    ):
-                        field_values.append({"value": subvalue, "format": text_format})
-                    else:
-                        field_values.append({"value": subvalue})
-                entity[field_name] = field_values
-            else:
-                row[field_name] = truncate_csv_value(
-                    field_name, id_field, field_definitions[field_name], row[field_name]
-                )
-                if (
-                    "formatted_text" in field_definitions[field_name]
-                    and field_definitions[field_name]["formatted_text"] is True
-                ):
-                    entity[field_name] = [
-                        {"value": row[field_name], "format": text_format}
-                    ]
+            subvalues = subvalues[: field_definitions[field_name]["cardinality"]]
+        for subvalue in subvalues:
+            subvalue = truncate_csv_value(
+                field_name, id_field, field_definitions[field_name], subvalue
+            )
+            if (
+                "formatted_text" in field_definitions[field_name]
+                and field_definitions[field_name]["formatted_text"] is True
+            ):
+                json_str = self.get_json(subvalue)
+                if json_str is False:
+                    field_values.append({"value": subvalue, "format": text_format})
                 else:
-                    entity[field_name] = [{"value": row[field_name]}]
-
-        # Cardinality has a limit, including 1.
-        else:
-            if config["subdelimiter"] in row[field_name]:
-                field_values = []
-                subvalues = row[field_name].split(config["subdelimiter"])
-                subvalues = self.remove_invalid_values(
-                    config, field_definitions, field_name, subvalues
-                )
-                subvalues = self.dedupe_values(subvalues)
-                if len(subvalues) > int(field_definitions[field_name]["cardinality"]):
-                    log_field_cardinality_violation(
-                        field_name,
-                        id_field,
-                        field_definitions[field_name]["cardinality"],
-                    )
-                subvalues = subvalues[: field_definitions[field_name]["cardinality"]]
-                for subvalue in subvalues:
-                    subvalue = truncate_csv_value(
-                        field_name, id_field, field_definitions[field_name], subvalue
-                    )
-                    if (
-                        "formatted_text" in field_definitions[field_name]
-                        and field_definitions[field_name]["formatted_text"] is True
-                    ):
-                        field_values.append({"value": subvalue, "format": text_format})
-                    else:
-                        field_values.append({"value": subvalue})
-                field_values = self.dedupe_values(field_values)
-                entity[field_name] = field_values
+                    field_values.append(json_str)
             else:
-                row[field_name] = truncate_csv_value(
-                    field_name, id_field, field_definitions[field_name], row[field_name]
-                )
-                if (
-                    "formatted_text" in field_definitions[field_name]
-                    and field_definitions[field_name]["formatted_text"] is True
-                ):
-                    entity[field_name] = [
-                        {"value": row[field_name], "format": text_format}
-                    ]
+                json_str = self.get_json(subvalue)
+                if json_str is False:
+                    field_values.append({"value": subvalue})
                 else:
-                    entity[field_name] = [{"value": row[field_name]}]
-
+                    field_values.append(json_str)
+        entity[field_name] = field_values
         return entity
 
     def update(
@@ -186,212 +142,154 @@ class SimpleField:
         # Cardinality has a limit.
         if field_definitions[field_name]["cardinality"] > 0:
             if config["update_mode"] == "append":
-                if config["subdelimiter"] in row[field_name]:
-                    subvalues = row[field_name].split(config["subdelimiter"])
-                    subvalues = self.remove_invalid_values(
-                        config, field_definitions, field_name, subvalues
-                    )
-                    for subvalue in subvalues:
-                        subvalue = truncate_csv_value(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name],
-                            subvalue,
-                        )
-                        if (
-                            "formatted_text" in field_definitions[field_name]
-                            and field_definitions[field_name]["formatted_text"] is True
-                        ):
-                            entity[field_name].append(
-                                {"value": subvalue, "format": text_format}
-                            )
-                        else:
-                            entity[field_name].append({"value": subvalue})
-                    entity[field_name] = self.dedupe_values(entity[field_name])
-                    if len(entity[field_name]) > int(
-                        field_definitions[field_name]["cardinality"]
-                    ):
-                        log_field_cardinality_violation(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name]["cardinality"],
-                        )
-                        entity[field_name] = entity[field_name][
-                            : field_definitions[field_name]["cardinality"]
-                        ]
-                else:
-                    row[field_name] = self.remove_invalid_values(
-                        config, field_definitions, field_name, row[field_name]
-                    )
-                    row[field_name] = truncate_csv_value(
+                subvalues = row[field_name].split(config["subdelimiter"])
+                subvalues = self.remove_invalid_values(
+                    config, field_definitions, field_name, subvalues
+                )
+                for subvalue in subvalues:
+                    subvalue = truncate_csv_value(
                         field_name,
                         row[entity_id_field],
                         field_definitions[field_name],
-                        row[field_name],
+                        subvalue,
                     )
+                    json_str = self.get_json(subvalue)
                     if (
                         "formatted_text" in field_definitions[field_name]
                         and field_definitions[field_name]["formatted_text"] is True
                     ):
-                        entity[field_name].append(
-                            {"value": row[field_name], "format": text_format}
-                        )
+                        if json_str is False:
+                            entity[field_name].append(
+                                {
+                                    "value": subvalue,
+                                    "format": text_format,
+                                }
+                            )
+                        else:
+                            entity[field_name].append(json_str)
                     else:
-                        entity[field_name].append({"value": row[field_name]})
-                    entity[field_name] = self.dedupe_values(entity[field_name])
-                    if len(entity[field_name]) > int(
-                        field_definitions[field_name]["cardinality"]
-                    ):
-                        log_field_cardinality_violation(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name]["cardinality"],
-                        )
-                        entity[field_name] = entity[field_name][
-                            : field_definitions[field_name]["cardinality"]
-                        ]
+                        if json_str is False:
+                            entity[field_name].append({"value": subvalue})
+                        else:
+                            entity[field_name].append(json_str)
+
+                entity[field_name] = self.dedupe_values(entity[field_name])
+                if len(entity[field_name]) > int(
+                    field_definitions[field_name]["cardinality"]
+                ):
+                    log_field_cardinality_violation(
+                        field_name,
+                        row[entity_id_field],
+                        field_definitions[field_name]["cardinality"],
+                    )
+                    entity[field_name] = entity[field_name][
+                        : field_definitions[field_name]["cardinality"]
+                    ]
 
             if config["update_mode"] == "replace":
-                if config["subdelimiter"] in row[field_name]:
-                    field_values = []
-                    subvalues = row[field_name].split(config["subdelimiter"])
-                    subvalues = self.remove_invalid_values(
-                        config, field_definitions, field_name, subvalues
+                field_values = []
+                subvalues = row[field_name].split(config["subdelimiter"])
+                subvalues = self.remove_invalid_values(
+                    config, field_definitions, field_name, subvalues
+                )
+                subvalues = self.dedupe_values(subvalues)
+                if len(subvalues) > int(field_definitions[field_name]["cardinality"]):
+                    log_field_cardinality_violation(
+                        field_name,
+                        row[entity_id_field],
+                        field_definitions[field_name]["cardinality"],
                     )
-                    subvalues = self.dedupe_values(subvalues)
-                    if len(subvalues) > int(
-                        field_definitions[field_name]["cardinality"]
-                    ):
-                        log_field_cardinality_violation(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name]["cardinality"],
-                        )
-                        subvalues = subvalues[
-                            : field_definitions[field_name]["cardinality"]
-                        ]
-                    for subvalue in subvalues:
-                        subvalue = truncate_csv_value(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name],
-                            subvalue,
-                        )
-                        if (
-                            "formatted_text" in field_definitions[field_name]
-                            and field_definitions[field_name]["formatted_text"] is True
-                        ):
-                            field_values.append(
-                                {"value": subvalue, "format": text_format}
-                            )
-                        else:
-                            field_values.append({"value": subvalue})
-                    field_values = self.dedupe_values(field_values)
-                    entity[field_name] = field_values
-                else:
-                    row[field_name] = truncate_csv_value(
+                    subvalues = subvalues[
+                        : field_definitions[field_name]["cardinality"]
+                    ]
+                for subvalue in subvalues:
+                    subvalue = truncate_csv_value(
                         field_name,
                         row[entity_id_field],
                         field_definitions[field_name],
-                        row[field_name],
+                        subvalue,
                     )
+                    json_str = self.get_json(subvalue)
                     if (
                         "formatted_text" in field_definitions[field_name]
                         and field_definitions[field_name]["formatted_text"] is True
                     ):
-                        entity[field_name] = [
-                            {"value": row[field_name], "format": text_format}
-                        ]
+                        if json_str is False:
+                            field_values.append(
+                                {
+                                    "value": subvalue,
+                                    "format": text_format,
+                                }
+                            )
+                        else:
+                            field_values.append(json_str)
                     else:
-                        entity[field_name] = [{"value": row[field_name]}]
+                        if json_str is False:
+                            field_values.append({"value": subvalue})
+                        else:
+                            field_values.append(json_str)
+                field_values = self.dedupe_values(field_values)
+                entity[field_name] = field_values
 
         # Cardinatlity is unlimited.
         else:
             if config["update_mode"] == "append":
-                if config["subdelimiter"] in row[field_name]:
-                    field_values = []
-                    subvalues = row[field_name].split(config["subdelimiter"])
-                    subvalues = self.remove_invalid_values(
-                        config, field_definitions, field_name, subvalues
-                    )
-                    for subvalue in subvalues:
-                        subvalue = truncate_csv_value(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name],
-                            subvalue,
-                        )
-                        if (
-                            "formatted_text" in field_definitions[field_name]
-                            and field_definitions[field_name]["formatted_text"] is True
-                        ):
-                            field_values.append(
-                                {"value": subvalue, "format": text_format}
-                            )
-                        else:
-                            field_values.append({"value": subvalue})
-                    entity[field_name] = entity_field_values + field_values
-                    entity[field_name] = self.dedupe_values(entity[field_name])
-                else:
-                    row[field_name] = truncate_csv_value(
+                field_values = []
+                subvalues = row[field_name].split(config["subdelimiter"])
+                subvalues = self.remove_invalid_values(
+                    config, field_definitions, field_name, subvalues
+                )
+                for subvalue in subvalues:
+                    subvalue = truncate_csv_value(
                         field_name,
                         row[entity_id_field],
                         field_definitions[field_name],
-                        row[field_name],
+                        subvalue,
                     )
                     if (
                         "formatted_text" in field_definitions[field_name]
                         and field_definitions[field_name]["formatted_text"] is True
                     ):
-                        entity[field_name] = entity_field_values + [
-                            {"value": row[field_name], "format": text_format}
-                        ]
+                        field_values.append({"value": subvalue, "format": text_format})
                     else:
-                        entity[field_name] = entity_field_values + [
-                            {"value": row[field_name]}
-                        ]
-                    entity[field_name] = self.dedupe_values(entity[field_name])
+                        field_values.append({"value": subvalue})
+                entity[field_name] = entity_field_values + field_values
+                entity[field_name] = self.dedupe_values(entity[field_name])
+
             if config["update_mode"] == "replace":
-                if config["subdelimiter"] in row[field_name]:
-                    field_values = []
-                    subvalues = row[field_name].split(config["subdelimiter"])
-                    subvalues = self.remove_invalid_values(
-                        config, field_definitions, field_name, subvalues
-                    )
-                    for subvalue in subvalues:
-                        subvalue = truncate_csv_value(
-                            field_name,
-                            row[entity_id_field],
-                            field_definitions[field_name],
-                            subvalue,
-                        )
-                        if (
-                            "formatted_text" in field_definitions[field_name]
-                            and field_definitions[field_name]["formatted_text"] is True
-                        ):
-                            field_values.append(
-                                {"value": subvalue, "format": text_format}
-                            )
-                        else:
-                            field_values.append({"value": subvalue})
-                    entity[field_name] = field_values
-                    entity[field_name] = self.dedupe_values(entity[field_name])
-                else:
-                    row[field_name] = truncate_csv_value(
+                field_values = []
+                subvalues = row[field_name].split(config["subdelimiter"])
+                subvalues = self.remove_invalid_values(
+                    config, field_definitions, field_name, subvalues
+                )
+                for subvalue in subvalues:
+                    subvalue = truncate_csv_value(
                         field_name,
                         row[entity_id_field],
                         field_definitions[field_name],
-                        row[field_name],
+                        subvalue,
                     )
+                    json_str = self.get_json(subvalue)
                     if (
                         "formatted_text" in field_definitions[field_name]
                         and field_definitions[field_name]["formatted_text"] is True
                     ):
-                        entity[field_name] = [
-                            {"value": row[field_name], "format": text_format}
-                        ]
+                        if json_str is False:
+                            field_values.append(
+                                {
+                                    "value": subvalue,
+                                    "format": text_format,
+                                }
+                            )
+                        else:
+                            field_values.append(json_str)
                     else:
-                        entity[field_name] = [{"value": row[field_name]}]
+                        if json_str is False:
+                            field_values.append({"value": subvalue})
+                        else:
+                            field_values.append(json_str)
+                entity[field_name] = field_values
+                entity[field_name] = self.dedupe_values(entity[field_name])
 
         return entity
 
@@ -503,6 +401,13 @@ class SimpleField:
             return None
         else:
             return subvalues[0]
+
+    def get_json(self, json_str):
+        try:
+            j = json.loads(json_str)
+            return j
+        except ValueError:
+            return False
 
 
 class GeolocationField:
