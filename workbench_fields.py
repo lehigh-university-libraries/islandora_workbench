@@ -179,7 +179,7 @@ class SimpleField:
                             {"value": subvalue, "format": text_format}
                         )
                     else:
-                        field_values.append(json_str)
+                        entity[field_name].append(json_str)
                 else:
                     if field_definitions[field_name][
                         "field_type"
@@ -224,9 +224,7 @@ class SimpleField:
                     and field_definitions[field_name]["formatted_text"] is True
                 ):
                     if json_str is False:
-                        entity[field_name].append(
-                            {"value": subvalue, "format": text_format}
-                        )
+                        field_values.append({"value": subvalue, "format": text_format})
                     else:
                         field_values.append(json_str)
                 else:
@@ -239,9 +237,9 @@ class SimpleField:
                     ] == "float" and value_is_numeric(subvalue, allow_decimals=True):
                         subvalue = float(subvalue)
                     if json_str is False:
-                        entity[field_name].append({"value": subvalue})
+                        field_values.append({"value": subvalue})
                     else:
-                        entity[field_name].append(json_str)
+                        field_values.append(json_str)
             field_values = self.dedupe_values(field_values)
             entity[field_name] = field_values
 
