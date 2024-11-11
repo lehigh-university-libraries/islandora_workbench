@@ -388,11 +388,15 @@ class SimpleField:
             return subvalues[0]
 
     def get_json(self, json_str):
+        if value_is_numeric(json_str, allow_decimals=True):
+            return False
+
         try:
             j = json.loads(json_str)
             return j
         except ValueError:
             return False
+        return False
 
 
 class GeolocationField:
