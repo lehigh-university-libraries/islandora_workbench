@@ -15,6 +15,7 @@ import collections
 import subprocess
 import requests_cache
 from progress_bar import InitBar
+from ruamel.yaml import YAML
 from workbench_utils import *
 import workbench_fields
 from WorkbenchConfig import WorkbenchConfig
@@ -47,8 +48,9 @@ def create():
         logging.info(message)
 
     path_to_rollback_csv_file = get_rollback_csv_filepath(config)
+    write_rollback_config(config, path_to_rollback_csv_file)
     prep_rollback_csv(config, path_to_rollback_csv_file)
-    logging.info("Writing rollback CSV to " + path_to_rollback_csv_file)
+    logging.info(f"Writing rollback CSV to {path_to_rollback_csv_file}.")
 
     prepare_csv_id_to_node_id_map(config)
 
@@ -105,6 +107,17 @@ def create():
 
     row_count = 0
     for row in csv_data:
+        if (
+            "node_exists_verification_view_endpoint" in config
+            and get_node_exists_verification_view_endpoint(config) is not False
+        ):
+            candidate_node_id = verify_node_exists_by_key(config, copy.copy(row))
+            if candidate_node_id is not False:
+                message = f"Item in row {row[config['id_field']]} appears to already be in Drupal ({config['host']}/node/{candidate_node_id}), skipping it."
+                logging.warning(message)
+                print(message)
+                continue
+
         # Delete expired items from request_cache before processing a row.
         if config["enable_http_cache"] is True:
             requests_cache.delete(expired=True)
@@ -163,6 +176,21 @@ def create():
             # Reset it to empty so it doesn't throw a key error in the code
             # in the "Assemble Drupal field structures..." section below.
             row["promote"] = ""
+
+        # print("DEBUG field_member_of", row)
+        if "field_member_of" in row.keys() and (
+            len(row["field_member_of"]) > 0
+            and value_is_numeric(row["field_member_of"]) is False
+        ):
+            field_member_of_value_for_message = copy.copy(row["field_member_of"])
+            row["field_member_of"] = get_nid_from_url_alias(
+                config, row["field_member_of"]
+            )
+            if row["field_member_of"] is False:
+                # @TODO: Use this version of the message in --check.
+                message = f'Node identified in "field_member_of" ({field_member_of_value_for_message}) in CSV row with ID "{id_field}" cannot be found or accessed.'
+                print("Warning: " + message)
+                logging.warning(message)
 
         # We want to collect the node IDs of items that are parents in-session
         # to accommodate users who have 'query_csv_id_to_node_id_map_for_parents: false'
@@ -253,6 +281,10 @@ def create():
 
             # 'checksum' is a reserved CSV field.
             if custom_field == "checksum":
+                continue
+
+            # 'directory' is a reserved CSV field.
+            if custom_field == "directory":
                 continue
 
             # We skip CSV columns whose headers use the 'media:video:field_foo' media track convention.
@@ -388,13 +420,16 @@ def create():
                     + "."
                 )
             logging.info(
-                'Node for "%s (record %s)" created at %s.',
+                'Node for "%s" (record %s) created at %s.',
                 row["title"],
                 id_field,
                 node_uri,
             )
             if "output_csv" in config.keys():
-                write_to_output_csv(config, id_field, node_response.text, row)
+                # We pass a copy of the row into this function because Python.
+                write_to_output_csv(
+                    config, id_field, node_response.text, copy.deepcopy(row)
+                )
         else:
             message = "Node for CSV record " + id_field + " not created"
             print("ERROR: " + message + ".")
@@ -412,13 +447,14 @@ def create():
         # Execute node-specific post-create scripts, if any are configured.
         if "node_post_create" in config and len(config["node_post_create"]) > 0:
             for command in config["node_post_create"]:
-                post_task_output, post_task_return_code = (
-                    execute_entity_post_task_script(
-                        command,
-                        args.config,
-                        node_response.status_code,
-                        node_response.text,
-                    )
+                (
+                    post_task_output,
+                    post_task_return_code,
+                ) = execute_entity_post_task_script(
+                    command,
+                    args.config,
+                    node_response.status_code,
+                    node_response.text,
                 )
                 if post_task_return_code == 0:
                     logging.info(
@@ -435,8 +471,6 @@ def create():
         # If 'url_alias' is in the CSV, create the alias.
         if "url_alias" in row and len(row["url_alias"]) > 0:
             create_url_alias(config, node_id, row["url_alias"])
-
-        write_rollback_config(config, path_to_rollback_csv_file)
 
         # If the file named in 'file' can't be found.
         if "file" in row and len(row["file"].strip()) > 0:
@@ -495,7 +529,6 @@ def create():
                         row["file"],
                         media_response_status_code,
                     )
-
             if config["nodes_only"] is False and "additional_files" in config:
                 additional_files_config = get_additional_files_config(config)
                 if len(additional_files_config) > 0:
@@ -504,6 +537,9 @@ def create():
                         additional_file_media_use_tid,
                     ) in additional_files_config.items():
                         # If there is no additional media file, move on to the next "additional_files" column.
+                        if additional_file_field not in row:
+                            continue
+
                         if (
                             additional_file_field in row
                             and len(row[additional_file_field].strip()) == 0
@@ -607,7 +643,6 @@ def update():
     field_definitions = get_field_definitions(config, "node")
     csv_data = get_csv_data(config)
     csv_column_headers = csv_data.fieldnames
-    # invalid_target_ids = []
 
     if config["log_term_creation"] is False:
         logging.info(
@@ -616,23 +651,25 @@ def update():
 
     row_count = 0
     for row in csv_data:
+        # WIP on #785: print("DEBUG from within update()", row)
         # Delete expired items from request_cache before processing a row.
         if config["enable_http_cache"] is True:
             requests_cache.delete(expired=True)
 
-        if not value_is_numeric(row["node_id"]):
-            row["node_id"] = get_nid_from_url_alias(config, row["node_id"])
-        node_ping_result = ping_node(config, row["node_id"], "GET", True)
-        if node_ping_result is False:
+        node_id_to_ping = copy.copy(row["node_id"])
+        if not value_is_numeric(node_id_to_ping):
+            node_id_to_ping = get_nid_from_url_alias(config, node_id_to_ping)
+        node_ping_result = ping_node(config, node_id_to_ping, "GET", True)
+        if node_id_to_ping is False or node_ping_result is False:
             if config["progress_bar"] is False:
                 print(
                     "Node "
-                    + row["node_id"]
+                    + str(node_id_to_ping)
                     + " not found or not accessible, skipping update."
                 )
             logging.warning(
                 "Node "
-                + row["node_id"]
+                + str(node_id_to_ping)
                 + " not found or not accessible, skipping update."
             )
             continue
@@ -815,7 +852,11 @@ def update():
                 )
 
         if node_has_all_fields is True:
-            node_endpoint = config["host"] + "/node/" + row["node_id"] + "?_format=json"
+            if value_is_numeric(row["node_id"]) is False:
+                row["node_id"] = get_nid_from_url_alias(config, row["node_id"])
+            node_endpoint = (
+                config["host"] + "/node/" + str(row["node_id"]) + "?_format=json"
+            )
             node_headers = {"Content-Type": "application/json"}
             # Make a GET request to the content type
             content_type_endpoint = f"{config['host']}/entity/node_type/{config['content_type']}?_format=json"
@@ -847,11 +888,11 @@ def update():
                         "Node "
                         + config["host"]
                         + "/node/"
-                        + row["node_id"]
+                        + str(row["node_id"])
                         + " updated."
                     )
                 logging.info(
-                    "Node %s updated.", config["host"] + "/node/" + row["node_id"]
+                    "Node %s updated.", config["host"] + "/node/" + str(row["node_id"])
                 )
             else:
                 if config["progress_bar"] is False:
@@ -859,7 +900,7 @@ def update():
                         "Error: Node "
                         + config["host"]
                         + "/node/"
-                        + row["node_id"]
+                        + str(row["node_id"])
                         + " not updated. See log for more detail."
                     )
                 logging.error(
@@ -871,13 +912,14 @@ def update():
             # Execute node-specific post-create scripts, if any are configured.
             if "node_post_update" in config and len(config["node_post_update"]) > 0:
                 for command in config["node_post_update"]:
-                    post_task_output, post_task_return_code = (
-                        execute_entity_post_task_script(
-                            command,
-                            args.config,
-                            node_response.status_code,
-                            node_response.text,
-                        )
+                    (
+                        post_task_output,
+                        post_task_return_code,
+                    ) = execute_entity_post_task_script(
+                        command,
+                        args.config,
+                        node_response.status_code,
+                        node_response.text,
                     )
                     if post_task_return_code == 0:
                         logging.info(
@@ -1319,18 +1361,9 @@ def update_media() -> None:
 
         if file_to_delete:
             # Now we delete the file
-            if config["standalone_media_url"] is True:
-                file_endpoint = (
-                    config["host"] + "/entity/file/" + file_to_delete + "?_format=json"
-                )
-            else:
-                file_endpoint = (
-                    config["host"]
-                    + "/entity/file/"
-                    + file_to_delete
-                    + "/edit?_format=json"
-                )
-
+            file_endpoint = (
+                config["host"] + "/entity/file/" + file_to_delete + "?_format=json"
+            )
             file_response = issue_request(config, "DELETE", file_endpoint)
             if file_response.status_code == 204:
                 logging.info(
@@ -1339,9 +1372,9 @@ def update_media() -> None:
                 return True
             else:
                 logging.error(
-                    "File %s (from media %s) not deleted (HTTP response code %s). Assuming there was no file and attempting to add new file.",
+                    "File %s (from media %s) not deleted (HTTP response code %s).",
                     file_to_delete,
-                    media_id,
+                    file_endpoint,
                     file_response.status_code,
                 )
                 return False
@@ -1722,9 +1755,12 @@ def update_media() -> None:
                     )
                     invalid_track_file = True
                     break
-                track_label, track_type, track_language, track_filepath = (
-                    track_file.split(":")
-                )
+                (
+                    track_label,
+                    track_type,
+                    track_language,
+                    track_filepath,
+                ) = track_file.split(":")
                 track_files_info["track_labels"].append(track_label)
                 track_files_info["track_types"].append(track_type)
                 track_files_info["track_languages"].append(track_language)
@@ -2228,8 +2264,9 @@ def create_from_files():
     files = os.listdir(file_dir_path)
 
     path_to_rollback_csv_file = get_rollback_csv_filepath(config)
+    write_rollback_config(config, path_to_rollback_csv_file)
     prep_rollback_csv(config, path_to_rollback_csv_file)
-    logging.info("Writing rollback CSV to " + path_to_rollback_csv_file)
+    logging.info(f"Writing rollback CSV to {path_to_rollback_csv_file}.")
 
     num_files = len(files)
     file_count = 0
@@ -2302,13 +2339,14 @@ def create_from_files():
             # Execute node-specific post-create scripts, if any are configured.
             if "node_post_create" in config and len(config["node_post_create"]) > 0:
                 for command in config["node_post_create"]:
-                    post_task_output, post_task_return_code = (
-                        execute_entity_post_task_script(
-                            command,
-                            args.config,
-                            node_response.status_code,
-                            node_response.text,
-                        )
+                    (
+                        post_task_output,
+                        post_task_return_code,
+                    ) = execute_entity_post_task_script(
+                        command,
+                        args.config,
+                        node_response.status_code,
+                        node_response.text,
                     )
                     if post_task_return_code == 0:
                         logging.info(
@@ -2668,13 +2706,14 @@ def get_data_from_view():
                 # Execute node-specific post-export scripts, if any are configured.
                 if "node_post_export" in config and len(config["node_post_export"]) > 0:
                     for command in config["node_post_export"]:
-                        post_task_output, post_task_return_code = (
-                            execute_entity_post_task_script(
-                                command,
-                                args.config,
-                                response.status_code,
-                                json.dumps(node),
-                            )
+                        (
+                            post_task_output,
+                            post_task_return_code,
+                        ) = execute_entity_post_task_script(
+                            command,
+                            args.config,
+                            response.status_code,
+                            json.dumps(node),
                         )
                         if post_task_return_code == 0:
                             logging.info(
@@ -2746,13 +2785,14 @@ def get_data_from_view():
                         and len(config["node_post_export"]) > 0
                     ):
                         for command in config["node_post_export"]:
-                            post_task_output, post_task_return_code = (
-                                execute_entity_post_task_script(
-                                    command,
-                                    args.config,
-                                    response.status_code,
-                                    json.dumps(node),
-                                )
+                            (
+                                post_task_output,
+                                post_task_return_code,
+                            ) = execute_entity_post_task_script(
+                                command,
+                                args.config,
+                                response.status_code,
+                                json.dumps(node),
                             )
                             if post_task_return_code == 0:
                                 logging.info(
@@ -3079,6 +3119,13 @@ def update_terms():
             "'log_term_creation' configuration setting is False. Creation of new taxonomy terms will not be logged."
         )
 
+    if "term_id" not in csv_column_headers:
+        message = (
+            'For "update_terms" tasks, your CSV file must contain a "term_id" column.'
+        )
+        logging.error(message)
+        sys.exit("Error: " + message)
+
     method = "GET"
     row_count = 0
     for row in csv_data:
@@ -3273,6 +3320,107 @@ def update_terms():
                 pbar(row_position)
 
 
+def create_redirects():
+    """Create new redirect entities via POST."""
+    message = '"Create redirects" task started using config file ' + args.config + "."
+    print(message)
+    logging.info(message)
+
+    if config["progress_bar"] is True:
+        csv_data_to_count = list(get_csv_data(config))
+        num_csv_records = len(csv_data_to_count)
+        pbar = InitBar()
+
+    # This is the CSV data for creating non-hierarchical or child terms.
+    csv_data = get_csv_data(config)
+
+    redirect_row_count = 0
+    for row in csv_data:
+        # Delete expired items from request_cache before processing a row.
+        if config["enable_http_cache"] is True:
+            requests_cache.delete(expired=True)
+
+        redirect_row_count += 1
+
+        if row["redirect_source"].lower().startswith("http"):
+            message = (
+                'Redirect source values cannot contain a hostname, they must be a path only. Skipping creating redirect from "'
+                + row["redirect_source"]
+                + '".'
+            )
+            print("Warning: " + message)
+            logging.warning(message)
+            continue
+
+        if row["redirect_target"].lower().startswith("http") is False:
+            # It's an internal redirect.
+            redirect_target = f'internal:/{row["redirect_target"]}'
+        else:
+            # It's an external redirect.
+            redirect_target = row["redirect_target"]
+
+        # Check to see if the redirect source value is already a redirect. We don't use issue_request()
+        # since we don't want to override config["allow_redirects"] for this one request.
+        is_redirect_url = config["host"].rstrip("/") + "/" + row["redirect_source"]
+        is_redirect_response = requests.head(
+            is_redirect_url,
+            allow_redirects=False,
+            verify=config["secure_ssl_only"],
+            auth=(config["username"], config["password"]),
+        )
+        if str(is_redirect_response.status_code).startswith("30"):
+            message = (
+                'Redirect from "'
+                + row["redirect_source"].strip()
+                + '" is already a redirect (HTTP response code is '
+                + str(is_redirect_response.status_code)
+                + "), skipping."
+            )
+            print("Warning: " + message)
+            logging.warning(message)
+            continue
+
+        # @TODO: --check should indicate that the redirect source path doesn't exist.
+        redirect = {
+            "type": [{"value": "redirect"}],
+            "redirect_source": [{"path": row["redirect_source"].lstrip("/").strip()}],
+            "redirect_redirect": [{"uri": redirect_target.strip()}],
+            "status_code": [{"value": int(config["redirect_status_code"])}],
+        }
+        redirect_endpoint = config["host"] + "/entity/redirect?_format=json"
+        headers = {"Content-Type": "application/json"}
+        response = issue_request(
+            config, "POST", redirect_endpoint, headers, redirect, None
+        )
+        if response.status_code == 201:
+            message = (
+                'OK, Redirect from "'
+                + row["redirect_source"].strip()
+                + '" to "'
+                + row["redirect_target"].strip()
+                + '" created.'
+            )
+            print(message)
+            logging.info(message)
+        else:
+            message = (
+                'Redirect from "'
+                + row["redirect_source"].strip()
+                + '" to "'
+                + row["redirect_target"].strip()
+                + '" not created.'
+            )
+            print("Error: " + message + " See log for more info.")
+            logging.error(message + " HTTP status code: " + str(response.status_code))
+
+        if config["progress_bar"] is True:
+            redirect_row_position = get_percentage(redirect_row_count, num_csv_records)
+            pbar(redirect_row_position)
+
+    if config["progress_bar"] is True:
+        pbar(100)
+
+
 # Main program logic.
 
 parser = argparse.ArgumentParser()
@@ -3298,13 +3446,70 @@ parser.add_argument(
 parser.add_argument(
     "--contactsheet", help="Generate a contact sheet.", action="store_true"
 )
+parser.add_argument(
+    "--skip_user_prompts",
+    help='Include to skip any user prompts defined in your config file\'s "user_prompts" setting.',
+    action="store_true",
+)
 parser.add_argument("--version", action="version", version="Islandora Workbench 0.0.0")
 args = parser.parse_args()
 
-workbench_config = WorkbenchConfig(args)
+try:
+    workbench_config = WorkbenchConfig(args)
+except Exception as e:
+    # Workbench wouldn't get this far as the YAML config file has syntax errors or is not found,
+    # or there has been a connection error such as an expired SSL cert. We can't log the exception
+    # since config isn't initialized yet.
+    yaml = YAML()
+    with open(args.config, "r") as stream:
+        config_to_get_host_value = yaml.load(stream)
+    print(f"Oops, Workbench can't connect to {config_to_get_host_value['host']}.")
+    print(
+        'Confirm your "host" configuration setting is correct and that the website is running, and try again.'
+    )
+    sys.exit(str(e))
 config = workbench_config.get_config()
 
+if args.check is not True and config["remind_user_to_run_check"] is True:
+    if args.skip_user_prompts is not True:
+        user_has_run_check = input("Have you run --check? (y/n)")
+        if user_has_run_check.lower() != "y":
+            logging.info(
+                'User was prompted whether they ran --check, and they responded "n".'
+            )
+            sys.exit(
+                "Your Workbench configuration file indicates you were to be reminded to run --check."
+            )
+
+if args.check is not True and "check_lock_file_path" in config:
+    check_lock_file_path = config["check_lock_file_path"]
+    if os.path.exists(check_lock_file_path):
+        config_file_md5 = get_file_hash_from_local(
+            config, config["config_file_path"], "md5"
+        )
+        with open(check_lock_file_path, "r") as check_lock_file:
+            check_lock_message_expected = f"Check against {config['config_file_path']} (md5 hash {config_file_md5}) OK"
+            check_lock_message_from_file = check_lock_file.readline()
+            if (
+                check_lock_message_expected.strip()
+                != check_lock_message_from_file.strip()
+            ):
+                message = f'The "check_lock_file_path" setting is present in config, but the contents of the lock file ("{check_lock_message_from_file.strip()}") do not match the expected --check lock message ("{check_lock_message_expected.strip()}").'
+                logging.error(message)
+                sys.exit("Error: " + message)
+            else:
+                message = f'Check lock file "{check_lock_file_path}" confirms --check was run. Removing lock file.'
+                logging.info(message)
+                os.remove(config["check_lock_file_path"])
+    else:
+        message = f'The "check_lock_file_path" setting is present in config but the specified lock file, "{check_lock_file_path}", does not exist.'
+        logging.error(message)
+        sys.exit("Error: " + message)
+
 create_temp_dir(config)
+
+if "user_prompts" in config and args.skip_user_prompts is not True:
+    prompt_user(config)
 
 if config["secondary_tasks"] is not None and len(config["secondary_tasks"]) > 0:
     secondary_tasks = []
@@ -3321,13 +3526,38 @@ if config["secondary_tasks"] is not None and len(config["secondary_tasks"]) > 0:
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
-logging.basicConfig(
-    filename=config["log_file_path"],
-    level=logging.INFO,
-    filemode=config["log_file_mode"],
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%d-%b-%y %H:%M:%S",
-)
+if config["log_file_name_and_line_number"] is True:
+    logging.basicConfig(
+        filename=config["log_file_path"],
+        level=logging.INFO,
+        filemode=config["log_file_mode"],
+        format="%(asctime)s - %(levelname)s - %(filename)s - %(lineno)d - %(message)s",
+        datefmt="%d-%b-%y %H:%M:%S",
+    )
+else:
+    logging.basicConfig(
+        filename=config["log_file_path"],
+        level=logging.INFO,
+        filemode=config["log_file_mode"],
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%d-%b-%y %H:%M:%S",
+    )
+
+ping_islandora(config, print_message=True)
+check_integration_module_version(config)
+
+validate_input_dir(config)
+
+# Unzip (and fetch if remote) input data zip archives.
+if len(config["input_data_zip_archives"]) > 0 and config["nodes_only"] is not True:
+    for input_data_zip_archive in config["input_data_zip_archives"]:
+        if input_data_zip_archive.lower().startswith("http"):
+            downloaded_zip_file_path = download_remote_archive_file(
+                config, input_data_zip_archive
+            )
+            unzip_archive(config, downloaded_zip_file_path)
+        else:
+            unzip_archive(config, input_data_zip_archive)
 
 if "check" in config.keys():
     tasks_to_skip = ["create_from_files", "get_data_from_view"]
@@ -3363,11 +3593,6 @@ if (
     and config["input_csv"].endswith(".xlsx") is True
 ):
     get_csv_from_excel(config)
-
-validate_input_dir(config)
-
-ping_islandora(config, print_message=True)
-check_integration_module_version(config)
 
 if config["enable_http_cache"] is True:
     if config["http_cache_storage"] == "sqlite" and os.path.exists("http_cache.sqlite"):
@@ -3449,6 +3674,8 @@ try:
         update_media()
     if config["task"] == "update_terms":
         update_terms()
+    if config["task"] == "create_redirects":
+        create_redirects()
 
     if config["secondary_tasks"] is not None and len(config["secondary_tasks"]) > 0:
         for secondary_config_file in config["secondary_tasks"]:

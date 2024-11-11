@@ -20,6 +20,24 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import workbench_utils
 
 
+class TestFailToConnect(unittest.TestCase):
+
+    def test_failed_to_connect(self):
+        self.current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_file_path = os.path.join(
+            self.current_dir, "assets", "check_test", "fail_to_connect.yml"
+        )
+        cmd = ["./workbench", "--config", config_file_path, "--check"]
+        try:
+            output = subprocess.check_output(cmd)
+            output = output.decode().strip()
+            self.assertRegex(
+                output, "Workbench can't connect to https://somebadhost.org", ""
+            )
+        except subprocess.CalledProcessError as err:
+            pass
+
+
 class TestCreateCheck(unittest.TestCase):
 
     def setUp(self):
@@ -684,6 +702,7 @@ class TestTaxonomies(unittest.TestCase):
         self.assertRegex(str(stdout), "1000000", "")
 
     def tearDown(self):
+        requests.packages.urllib3.disable_warnings()
         # Delete all terms in the genre taxonomy created by these tests.
         terms_to_delete = [
             "XNewspapers",
@@ -700,7 +719,9 @@ class TestTaxonomies(unittest.TestCase):
                 + "&_format=json"
             )
             get_tid_response = requests.get(
-                get_tid_url, auth=(self.islandora_username, self.islandora_password)
+                get_tid_url,
+                auth=(self.islandora_username, self.islandora_password),
+                verify=False,
             )
             term_data = json.loads(get_tid_response.text)
             if len(term_data):
@@ -714,6 +735,7 @@ class TestTaxonomies(unittest.TestCase):
                 term_delete_response = requests.delete(
                     delete_term_url,
                     auth=(self.islandora_username, self.islandora_password),
+                    verify=False,
                 )
 
         for nid in self.nids:
@@ -1541,6 +1563,45 @@ class TestAddMediaAllowMissingWithAdditionalFiles(unittest.TestCase):
 
         if os.path.exists(self.true_log_file_path):
             os.remove(self.true_log_file_path)
+
+
+class TestCsvRowFilters(unittest.TestCase):
+
+    def setUp(self):
+        self.current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_file_path = os.path.join(
+            self.current_dir,
+            "assets",
+            "csv_row_filters_test",
+            "csv_row_filters_test.yml",
+        )
+        self.temp_dir = tempfile.gettempdir()
+        self.preprocessed_csv_file_path = os.path.join(
+            self.temp_dir, "csv_row_filters_test.csv.preprocessed"
+        )
+
+        cmd = ["./workbench", "--config", config_file_path, "--check"]
+        output = subprocess.check_output(cmd)
+        self.output = output.decode().strip()
+
+    def test_update_check(self):
+        file = open(self.preprocessed_csv_file_path)
+        csv_rows = file.readlines()
+        file.close()
+
+        self.assertEqual(len(csv_rows), 3, "")
+        self.assertEqual(
+            csv_rows[1].strip(), ",issue_812_001,Issue 812 item 1,Image,2020-01-01", ""
+        )
+        self.assertEqual(
+            csv_rows[2].strip(),
+            "noo.jpg,issue_812_003,Issue 812 item 3,Binary,1999-01-01|2000",
+            "",
+        )
+
+    def tearDown(self):
+        if os.path.exists(self.preprocessed_csv_file_path):
+            os.remove(self.preprocessed_csv_file_path)
 
 
 if __name__ == "__main__":

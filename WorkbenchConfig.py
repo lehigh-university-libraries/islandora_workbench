@@ -82,6 +82,13 @@ class WorkbenchConfig:
                 config["temp_dir"], "csv_id_to_node_id_map.db"
             )
 
+        if "page_files_source_dir_field" in user_mods:
+            config["page_files_source_dir_field"] = user_mods[
+                "page_files_source_dir_field"
+            ]
+        else:
+            config["page_files_source_dir_field"] = config["id_field"]
+
         config["config_file"] = self.args.config
 
         return config
@@ -93,7 +100,11 @@ class WorkbenchConfig:
             try:
                 loaded = yaml.load(stream)
             except YAMLError as exc:
-                print(exc)
+                print(
+                    f"There appears to be a YAML syntax error in your configuration file, {self.args.config}. Remove the username and\npassword, and run the file through https://codebeautify.org/yaml-validator/ or your YAML validator of choice."
+                )
+                sys.exit()
+
         # 'media_file_fields' has been replaced with 'media_fields' and 'media_type_file_fields'.
         # This is aliasing code that can be removed at some point in the future.
         if "media_file_fields" in loaded:
@@ -194,6 +205,8 @@ class WorkbenchConfig:
             "paged_content_from_directories": False,
             "delete_media_with_nodes": True,
             "allow_adding_terms": False,
+            "columns_with_term_names": [],
+            "protected_vocabularies": [],
             "nodes_only": False,
             "log_response_time": False,
             "adaptive_pause_threshold": 2,
@@ -204,6 +217,7 @@ class WorkbenchConfig:
             "log_response_status_code": False,
             "log_headers": False,
             "log_term_creation": True,
+            "log_file_name_and_line_number": False,
             "progress_bar": False,
             "user_agent": "Islandora Workbench",
             "allow_redirects": True,
@@ -219,6 +233,8 @@ class WorkbenchConfig:
             "field_for_remote_filename": False,
             "field_for_media_title": False,
             "delete_tmp_upload": False,
+            "input_data_zip_archives": [],
+            "delete_zip_archive_after_extraction": True,
             "list_missing_drupal_fields": False,
             "secondary_tasks": None,
             "sqlite_db_filename": "workbench_temp_data.db",
@@ -264,6 +280,12 @@ class WorkbenchConfig:
             "ignore_existing_parent_ids": True,
             "query_csv_id_to_node_id_map_for_parents": False,
             "ignore_duplicate_parent_ids": True,
+            "redirect_status_code": 301,
+            "csv_value_templates": [],
+            "csv_value_templates_for_paged_content": [],
+            "csv_value_templates_rand_length": 5,
+            "allow_csv_value_templates_if_field_empty": [],
+            "remind_user_to_run_check": False,
         }
 
     # Tests validity and existence of configuration file path.
