@@ -102,6 +102,7 @@ class SimpleField:
                     field_values.append({"value": subvalue})
                 else:
                     field_values.append(json_str)
+        field_values = self.dedupe_values(field_values)
         entity[field_name] = field_values
 
         return entity
