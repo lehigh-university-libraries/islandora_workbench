@@ -396,7 +396,6 @@ class SimpleField:
             return j
         except ValueError:
             return False
-        return False
 
 
 class GeolocationField:
