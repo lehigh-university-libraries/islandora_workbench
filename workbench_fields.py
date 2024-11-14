@@ -71,7 +71,6 @@ class SimpleField:
             config, field_definitions, field_name, subvalues
         )
         subvalues = self.dedupe_values(subvalues)
-
         cardinality = int(field_definitions[field_name].get("cardinality", -1))
         if -1 < cardinality < len(subvalues):
             log_field_cardinality_violation(field_name, id_field, str(cardinality))
@@ -84,17 +83,25 @@ class SimpleField:
                 "formatted_text" in field_definitions[field_name]
                 and field_definitions[field_name]["formatted_text"] is True
             ):
-                field_values.append({"value": subvalue, "format": text_format})
+                json_str = self.get_json(subvalue)
+                if json_str is False:
+                    field_values.append({"value": subvalue, "format": text_format})
+                else:
+                    field_values.append(json_str)
             else:
-                if field_definitions[field_name][
-                    "field_type"
-                ] == "integer" and value_is_numeric(subvalue):
-                    subvalue = int(subvalue)
-                if field_definitions[field_name][
-                    "field_type"
-                ] == "float" and value_is_numeric(subvalue, allow_decimals=True):
-                    subvalue = float(subvalue)
-                field_values.append({"value": subvalue})
+                json_str = self.get_json(subvalue)
+                if json_str is False:
+                    if field_definitions[field_name][
+                        "field_type"
+                    ] == "integer" and value_is_numeric(subvalue):
+                        subvalue = int(subvalue)
+                    if field_definitions[field_name][
+                        "field_type"
+                    ] == "float" and value_is_numeric(subvalue, allow_decimals=True):
+                        subvalue = float(subvalue)
+                    field_values.append({"value": subvalue})
+                else:
+                    field_values.append(json_str)
         field_values = self.dedupe_values(field_values)
         entity[field_name] = field_values
 
@@ -162,13 +169,17 @@ class SimpleField:
                     field_definitions[field_name],
                     subvalue,
                 )
+                json_str = self.get_json(subvalue)
                 if (
                     "formatted_text" in field_definitions[field_name]
                     and field_definitions[field_name]["formatted_text"] is True
                 ):
-                    entity[field_name].append(
-                        {"value": subvalue, "format": text_format}
-                    )
+                    if json_str is False:
+                        entity[field_name].append(
+                            {"value": subvalue, "format": text_format}
+                        )
+                    else:
+                        entity[field_name].append(json_str)
                 else:
                     if field_definitions[field_name][
                         "field_type"
@@ -178,7 +189,10 @@ class SimpleField:
                         "field_type"
                     ] == "float" and value_is_numeric(subvalue, allow_decimals=True):
                         subvalue = float(subvalue)
-                    entity[field_name].append({"value": subvalue})
+                    if json_str is False:
+                        entity[field_name].append({"value": subvalue})
+                    else:
+                        entity[field_name].append(json_str)
             entity[field_name] = self.dedupe_values(entity[field_name])
             if -1 < cardinality < len(entity[field_name]):
                 log_field_cardinality_violation(
@@ -204,11 +218,15 @@ class SimpleField:
                     field_definitions[field_name],
                     subvalue,
                 )
+                json_str = self.get_json(subvalue)
                 if (
                     "formatted_text" in field_definitions[field_name]
                     and field_definitions[field_name]["formatted_text"] is True
                 ):
-                    field_values.append({"value": subvalue, "format": text_format})
+                    if json_str is False:
+                        field_values.append({"value": subvalue, "format": text_format})
+                    else:
+                        field_values.append(json_str)
                 else:
                     if field_definitions[field_name][
                         "field_type"
@@ -218,7 +236,10 @@ class SimpleField:
                         "field_type"
                     ] == "float" and value_is_numeric(subvalue, allow_decimals=True):
                         subvalue = float(subvalue)
-                    field_values.append({"value": subvalue})
+                    if json_str is False:
+                        field_values.append({"value": subvalue})
+                    else:
+                        field_values.append(json_str)
             field_values = self.dedupe_values(field_values)
             entity[field_name] = field_values
 
@@ -365,6 +386,16 @@ class SimpleField:
             return None
         else:
             return subvalues[0]
+
+    def get_json(self, json_str):
+        if value_is_numeric(json_str, allow_decimals=True):
+            return False
+
+        try:
+            j = json.loads(json_str)
+            return j
+        except ValueError:
+            return False
 
 
 class GeolocationField:
