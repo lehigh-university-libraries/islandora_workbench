@@ -156,6 +156,7 @@ class WorkbenchConfig:
                     "webm",
                     "ogv",
                     "mpeg",
+                    "m4v",
                 ]
             },
             {"extracted_text": ["txt"]},
