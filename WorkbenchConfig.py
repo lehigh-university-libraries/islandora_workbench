@@ -1,5 +1,4 @@
-"""Class to encapsulate Workbench configuration definitions.
-"""
+"""Class to encapsulate Workbench configuration definitions."""
 
 import logging
 from ruamel.yaml import YAML, YAMLError
@@ -32,13 +31,20 @@ class WorkbenchConfig:
         user_mods = self.get_user_config()
         # If the password is not set in the config file, or in the environment
         # variable, prompt the user for the password.
-        if "password" not in user_mods:
-            if "ISLANDORA_WORKBENCH_PASSWORD" in os.environ:
-                config["password"] = os.environ["ISLANDORA_WORKBENCH_PASSWORD"]
-            else:
-                config["password"] = getpass(
-                    f"Password for Drupal user {user_mods['username']}:"
-                )
+        try:
+            if "password" not in user_mods:
+                if "ISLANDORA_WORKBENCH_PASSWORD" in os.environ:
+                    config["password"] = os.environ["ISLANDORA_WORKBENCH_PASSWORD"]
+                else:
+                    config["password"] = getpass(
+                        f"Password for Drupal user {user_mods['username']}:"
+                    )
+        except KeyboardInterrupt:
+            try:
+                sys.exit(0)
+            except SystemExit:
+                os._exit(0)
+
         # Blend defaults with user mods
         for key, value in user_mods.items():
             config[key] = value
@@ -69,17 +75,20 @@ class WorkbenchConfig:
         config["current_config_file_path"] = os.path.abspath(self.args.config)
         config["field_text_format_ids"] = self.get_field_level_text_output_formats()
 
+        if "csv_id_to_node_id_map_dir" in user_mods:
+            config["csv_id_to_node_id_map_dir"] = user_mods["csv_id_to_node_id_map_dir"]
+        if "csv_id_to_node_id_map_filename" in user_mods:
+            config["csv_id_to_node_id_map_filename"] = user_mods[
+                "csv_id_to_node_id_map_filename"
+            ]
         if "csv_id_to_node_id_map_path" in user_mods:
-            if user_mods["csv_id_to_node_id_map_path"] is not False:
-                if os.path.isabs(config["csv_id_to_node_id_map_path"]) is False:
-                    config["csv_id_to_node_id_map_path"] = os.path.join(
-                        config["temp_dir"], "csv_id_to_node_id_map.db"
-                    )
-            else:
-                config["csv_id_to_node_id_map_path"] = False
+            config["csv_id_to_node_id_map_path"] = user_mods[
+                "csv_id_to_node_id_map_path"
+            ]
         else:
             config["csv_id_to_node_id_map_path"] = os.path.join(
-                config["temp_dir"], "csv_id_to_node_id_map.db"
+                config["csv_id_to_node_id_map_dir"],
+                config["csv_id_to_node_id_map_filename"],
             )
 
         if "page_files_source_dir_field" in user_mods:
@@ -220,6 +229,8 @@ class WorkbenchConfig:
             "log_term_creation": True,
             "log_file_name_and_line_number": False,
             "progress_bar": False,
+            "show_percentage_of_csv_input_processed": False,
+            "prompt_user_before_delete_task": False,
             "user_agent": "Islandora Workbench",
             "allow_redirects": True,
             "secure_ssl_only": True,
@@ -239,14 +250,29 @@ class WorkbenchConfig:
             "list_missing_drupal_fields": False,
             "secondary_tasks": None,
             "sqlite_db_filename": "workbench_temp_data.db",
+            "csv_id_to_node_id_map_dir": tempfile.gettempdir(),
+            "csv_id_to_node_id_map_filename": "csv_id_to_node_id_map.db",
             "fixity_algorithm": None,
             "validate_fixity_during_check": False,
             "output_csv_include_input_csv": False,
+            "export_file_url_instead_of_download": False,
             "timestamp_rollback": False,
             "rollback_dir": None,
+            "rollback_file_include_node_info": False,
             "enable_http_cache": True,
             "http_cache_storage": "memory",
             "http_cache_storage_expire_after": 1200,
+            "http_max_retries": 3,
+            "http_retry_on_status_codes": [500, 502, 503, 504],
+            "http_backoff_factor": 1,
+            "http_retry_allowed_methods": [
+                "HEAD",
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+            ],
             "validate_terms_exist": True,
             "validate_parent_node_exists": True,
             "media_types": self.get_media_types(),
@@ -287,6 +313,13 @@ class WorkbenchConfig:
             "csv_value_templates_rand_length": 5,
             "allow_csv_value_templates_if_field_empty": [],
             "remind_user_to_run_check": False,
+            "completion_message": None,
+            "media_type_by_media_use": False,
+            "paged_content_ignore_files": ["Thumbs.db"],
+            "include_password_in_rollback_config_file": False,
+            "remove_password_from_config_file": False,
+            "recovery_mode_starting_from_node_id": False,
+            "viewer_override_fieldname": "field_viewer_override",
         }
 
     # Tests validity and existence of configuration file path.

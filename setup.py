@@ -12,7 +12,7 @@ setup(
         "requests>=2.22,<3",
         "requests_cache>=1.1",
         "ruamel.yaml<=0.17.21",
-        "ruamel.yaml.clib<=0.2.8",
+        "ruamel.yaml.clib<=0.2.12",
         "pyparsing<3.2",
         "progress_bar",
         "openpyxl",
@@ -21,6 +21,6 @@ setup(
         "typing-extensions",
         "rich",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.9",
     py_modules=[],
 )

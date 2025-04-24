@@ -15,6 +15,8 @@ import collections
 import subprocess
 import requests_cache
 from progress_bar import InitBar
+from rich.console import Console
+from rich.table import Table
 from ruamel.yaml import YAML
 from workbench_utils import *
 import workbench_fields
@@ -26,6 +28,8 @@ def create():
     message = '"Create" task started using config file ' + args.config + "."
     print(message)
     logging.info(message)
+
+    check_rollback_file_path_directories(config)
 
     if config["ignore_existing_parent_ids"] is True:
         workbench_execution_start_time = "{:%Y-%m-%d %H:%M:%S}".format(
@@ -77,7 +81,7 @@ def create():
             )
 
     node_ids = dict()
-    csv_path = os.path.join(config["input_dir"], config["input_csv"])
+    # csv_path = os.path.join(config["input_dir"], config["input_csv"])
     field_definitions = get_field_definitions(config, "node")
     csv_data = get_csv_data(config)
     csv_column_headers = csv_data.fieldnames
@@ -85,6 +89,7 @@ def create():
     if (
         "parent_id" in csv_column_headers
         and config["query_csv_id_to_node_id_map_for_parents"] is False
+        and config["recovery_mode_starting_from_node_id"] is False
     ):
         message = "Only node IDs for parents created during this session will be used (not using the CSV ID to node ID map)."
         print(message)
@@ -107,6 +112,46 @@ def create():
 
     row_count = 0
     for row in csv_data:
+        row_count += 1
+        row_position_message = ""
+        if (
+            config["recovery_mode_starting_from_node_id"] is not False
+            and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+        ):
+            nid_in_map = recovery_mode_id_in_csv_id_to_node_id_map(
+                config, row[config["id_field"]]
+            )
+
+            if nid_in_map is not False:
+                message = f"Item in row {row[config['id_field']]} has already been ingested at ({config['host']}/node/{nid_in_map}), skipping it."
+                logging.info(message)
+
+                # Recover paged content from directories that have the current node as their parent.
+                if config["paged_content_from_directories"] is True:
+                    create_children_from_directory(config, row, nid_in_map)
+
+                continue
+
+            # If we have gotten this far, the current row has not been created in Drupal.
+            if "parent_id" in csv_column_headers and len(row["parent_id"]) > 0:
+                parent_node_id_query = "select node_id from csv_id_to_node_id_map where csv_id = ? and node_id >= ? order by timestamp desc limit 1"
+                parent_in_id_map_result = sqlite_manager(
+                    config,
+                    operation="select",
+                    query=parent_node_id_query,
+                    values=(
+                        row["parent_id"],
+                        config["recovery_mode_starting_from_node_id"],
+                    ),
+                    db_file_path=config["csv_id_to_node_id_map_path"],
+                )
+                if len(parent_in_id_map_result) > 0:
+                    row["field_member_of"] = str(parent_in_id_map_result[0][0])
+                else:
+                    message = f'Recovery mode was unable to find the node ID for the parent CSV row "{row["parent_id"]}" in theh CSV ID to node ID map.'
+                    print("Warning: " + message)
+                    logging.warning(message)
+
         if (
             "node_exists_verification_view_endpoint" in config
             and get_node_exists_verification_view_endpoint(config) is not False
@@ -177,21 +222,37 @@ def create():
             # in the "Assemble Drupal field structures..." section below.
             row["promote"] = ""
 
-        # print("DEBUG field_member_of", row)
-        if "field_member_of" in row.keys() and (
-            len(row["field_member_of"]) > 0
-            and value_is_numeric(row["field_member_of"]) is False
-            and config["subdelimiter"] not in row["field_member_of"]
-        ):
-            field_member_of_value_for_message = copy.copy(row["field_member_of"])
-            row["field_member_of"] = get_nid_from_url_alias(
-                config, row["field_member_of"]
+
+        if "field_member_of" in row.keys() and (len(row["field_member_of"]) > 0):
+            # First split out subvalues.
+            field_member_of_values = []
+            if config["subdelimiter"] in row["field_member_of"]:
+                field_member_of_values = row["field_member_of"].split(
+                    config["subdelimiter"]
+                )
+            else:
+                field_member_of_values.append(row["field_member_of"])
+
+            field_member_of_values_nids = []
+            for field_member_of_value in field_member_of_values:
+                if value_is_numeric(field_member_of_value) is False:
+                    # Get the node ID for each item in the list.
+                    field_member_of_value_nid = get_nid_from_url_alias(
+                        config, field_member_of_value
+                    )
+                    if field_member_of_value_nid is False:
+                        message = f'Node identified in "field_member_of" ({field_member_of_value}) in CSV row with ID "{id_field}" cannot be found or accessed.'
+                        print("Warning: " + message)
+                        logging.warning(message)
+                    else:
+                        field_member_of_values_nids.append(
+                            str(field_member_of_value_nid)
+                        )
+                else:
+                    field_member_of_values_nids.append(str(field_member_of_value))
+            row["field_member_of"] = config["subdelimiter"].join(
+                field_member_of_values_nids
             )
-            if row["field_member_of"] is False:
-                # @TODO: Use this version of the message in --check.
-                message = f'Node identified in "field_member_of" ({field_member_of_value_for_message}) in CSV row with ID "{id_field}" cannot be found or accessed.'
-                print("Warning: " + message)
-                logging.warning(message)
 
         # We want to collect the node IDs of items that are parents in-session
         # to accommodate users who have 'query_csv_id_to_node_id_map_for_parents: false'
@@ -400,7 +461,23 @@ def create():
             else:
                 populate_csv_id_to_node_id_map(config, "", "", id_field, node_id)
 
-            write_rollback_node_id(config, node_id, path_to_rollback_csv_file)
+            if "file" in row:
+                file_column = row["file"]
+            else:
+                file_column = ""
+            if "field_member_of" in row:
+                member_of = row["field_member_of"]
+            else:
+                member_of = ""
+            write_rollback_node_id(
+                config,
+                node_id,
+                row[config["id_field"]],
+                row["title"],
+                file_column,
+                member_of,
+                path_to_rollback_csv_file,
+            )
 
             if unpopulated_member_of_log_message is not None:
                 unpopulated_member_of_log_message = (
@@ -411,15 +488,13 @@ def create():
                 logging.warning(unpopulated_member_of_log_message)
 
             if config["progress_bar"] is False:
+                if config["show_percentage_of_csv_input_processed"] is True:
+                    row_position = get_percentage(row_count, num_csv_records)
+                    row_position_message = f" ({int(row_position)}%)"
                 print(
-                    'Node for "'
-                    + row["title"]
-                    + '" (record '
-                    + id_field
-                    + ") created at "
-                    + node_uri
-                    + "."
+                    f'Node for "{row["title"]}" (record {id_field}) created at {node_uri}{row_position_message}.'
                 )
+
             logging.info(
                 'Node for "%s" (record %s) created at %s.',
                 row["title"],
@@ -465,7 +540,6 @@ def create():
                     logging.error("Post node create script " + command + " failed.")
 
         if config["progress_bar"] is True:
-            row_count += 1
             row_position = get_percentage(row_count, num_csv_records)
             pbar(row_position)
 
@@ -652,6 +726,8 @@ def update():
 
     row_count = 0
     for row in csv_data:
+        row_count += 1
+        row_position_message = ""
         # WIP on #785: print("DEBUG from within update()", row)
         # Delete expired items from request_cache before processing a row.
         if config["enable_http_cache"] is True:
@@ -885,12 +961,11 @@ def update():
 
             if node_response.status_code == 200:
                 if config["progress_bar"] is False:
+                    if config["show_percentage_of_csv_input_processed"] is True:
+                        row_position = get_percentage(row_count, num_csv_records)
+                        row_position_message = f" ({int(row_position)}%)"
                     print(
-                        "Node "
-                        + config["host"]
-                        + "/node/"
-                        + str(row["node_id"])
-                        + " updated."
+                        f'Node { config["host"]}/node/{row["node_id"]} updated{row_position_message}.'
                     )
                 logging.info(
                     "Node %s updated.", config["host"] + "/node/" + str(row["node_id"])
@@ -908,6 +983,11 @@ def update():
                     "Node %s not updated (server response code was '%s').",
                     config["host"] + "/node/" + row["node_id"],
                     node_response.status_code,
+                )
+                logging.error(
+                    'JSON request body used in previous PATCH to "%s" was %s.',
+                    node_endpoint,
+                    node,
                 )
 
             # Execute node-specific post-create scripts, if any are configured.
@@ -932,7 +1012,7 @@ def update():
                         logging.error("Post node update script " + command + " failed.")
 
             if config["progress_bar"] is True:
-                row_count += 1
+                # row_count += 1
                 row_position = get_percentage(row_count, num_csv_records)
                 pbar(row_position)
 
@@ -947,10 +1027,24 @@ def delete():
     print(message)
     logging.info(message)
 
+    if config["prompt_user_before_delete_task"] is True:
+        csv_data_to_count = get_csv_data(config)
+        num_nodes_to_delete = len(list(csv_data_to_count))
+        if config["delete_media_with_nodes"] is True:
+            delete_prompt = f"You are about to delete {num_nodes_to_delete} nodes and their attached media. Continue? (y/n) "
+        else:
+            delete_prompt = f"You are about to delete {num_nodes_to_delete} nodes but not their attached media. Continue? (y/n) "
+        delete_response = input(delete_prompt)
+        if delete_response != "y":
+            logging.info('Response to confirmation to delete was not "y", exiting.')
+            sys.exit('You didn\'t respond "y", exiting.')
+
     csv_data = get_csv_data(config)
 
     row_count = 0
     for row in csv_data:
+        row_count += 1
+        row_position_message = ""
         # Delete expired items from request_cache before processing a row.
         if config["enable_http_cache"] is True:
             requests_cache.delete(expired=True)
@@ -1013,12 +1107,11 @@ def delete():
         node_response = issue_request(config, "DELETE", node_endpoint)
         if node_response.status_code == 204:
             if config["progress_bar"] is False:
+                if config["show_percentage_of_csv_input_processed"] is True:
+                    row_position = get_percentage(row_count, num_csv_records)
+                    row_position_message = f" ({int(row_position)}%)"
                 print(
-                    "Node "
-                    + config["host"]
-                    + "/node/"
-                    + str(row["node_id"])
-                    + " deleted."
+                    f'Node { config["host"]}/node/{row["node_id"]} deleted{row_position_message}.'
                 )
             logging.info(
                 "Node %s deleted.", config["host"] + "/node/" + str(row["node_id"])
@@ -2259,6 +2352,8 @@ def create_from_files():
     print(message)
     logging.info(message)
 
+    check_rollback_file_path_directories(config)
+
     prepare_csv_id_to_node_id_map(config)
 
     file_dir_path = config["input_dir"]
@@ -2272,6 +2367,18 @@ def create_from_files():
     num_files = len(files)
     file_count = 0
     for file_name in files:
+
+        if (
+            config["recovery_mode_starting_from_node_id"] is not False
+            and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+        ):
+            nid_in_map = recovery_mode_id_in_csv_id_to_node_id_map(config, file_name)
+            if nid_in_map is not False or not None:
+                message = f"File {file_name} has already been ingested at ({config['host']}/node/{nid_in_map}), skipping it."
+                logging.info(message)
+                file_count += 1
+                continue
+
         # Delete expired items from request_cache before processing a row.
         if config["enable_http_cache"] is True:
             requests_cache.delete(expired=True)
@@ -2333,7 +2440,16 @@ def create_from_files():
                 write_to_output_csv(config, "", node_response.text)
 
             node_nid = node_uri.rsplit("/", 1)[-1]
-            write_rollback_node_id(config, node_nid, path_to_rollback_csv_file)
+
+            write_rollback_node_id(
+                config,
+                node_nid,
+                "",
+                filename_without_extension,
+                file_name,
+                "",
+                path_to_rollback_csv_file,
+            )
 
             populate_csv_id_to_node_id_map(config, "", "", file_name, node_nid)
 
@@ -2381,6 +2497,11 @@ def create_from_files():
                 os.path.join(config["input_dir"], file_name),
                 node_response.status_code,
             )
+            logging.error(
+                'JSON request body used in previous POST to "%s" was %s.',
+                node_endpoint,
+                node_json,
+            )
 
         if config["progress_bar"] is True:
             file_count += 1
@@ -2395,6 +2516,8 @@ def export_csv():
     """Export a CSV file with values, in Islandora Workbench format,
     for each node in the input CSV.
     """
+    from workbench_export import CSVExporter
+
     message = '"Export CSV" task started using config file ' + args.config + "."
     if config["export_csv_term_mode"] == "name":
         message = (
@@ -2404,417 +2527,25 @@ def export_csv():
     print(message)
     logging.info(message)
 
-    field_definitions = get_field_definitions(config, "node")
-
-    field_labels = collections.OrderedDict()
-    field_names = list()
-    for field_name in field_definitions.keys():
-        field_names.append(field_name)
-    for field_name in [
-        "created",
-        "uid",
-        "langcode",
-        "title",
-        "node_id",
-        "REMOVE THIS COLUMN (KEEP THIS ROW)",
-    ]:
-        field_names.insert(0, field_name)
-
-    if len(config["export_csv_field_list"]) > 0:
-        field_names = config["export_csv_field_list"]
-
-    deduped_field_names = list("")
-    [deduped_field_names.append(x) for x in field_names if x not in deduped_field_names]
-    # We always include 'node_id and 'REMOVE THIS COLUMN (KEEP THIS ROW)'.
-    if "node_id" not in deduped_field_names:
-        deduped_field_names.insert(0, "node_id")
-        deduped_field_names.insert(0, "REMOVE THIS COLUMN (KEEP THIS ROW)")
-
-    for field_name in field_definitions:
-        if field_name in deduped_field_names:
-            if field_definitions[field_name]["label"] != "":
-                field_labels[field_name] = field_definitions[field_name]["label"]
-            else:
-                field_labels[field_name] = ""
-    field_labels["REMOVE THIS COLUMN (KEEP THIS ROW)"] = "LABEL (REMOVE THIS ROW)"
-
-    if config["export_csv_file_path"] is not None:
-        csv_file_path = config["export_csv_file_path"]
-    else:
-        csv_file_path = os.path.join(
-            config["input_dir"], config["input_csv"] + ".csv_file_with_field_values"
-        )
-    if os.path.exists(csv_file_path):
-        os.remove(csv_file_path)
-
-    if (
-        config["export_file_directory"] is not None
-        and "file" not in deduped_field_names
-    ):
-        deduped_field_names.append("file")
-
-    csv_file = open(csv_file_path, "a+", encoding="utf-8")
-    writer = csv.DictWriter(
-        csv_file, fieldnames=deduped_field_names, lineterminator="\n"
-    )
-    writer.writeheader()
-
-    writer.writerow(field_labels)
-
-    cardinality = collections.OrderedDict()
-    cardinality["REMOVE THIS COLUMN (KEEP THIS ROW)"] = (
-        "NUMBER OF VALUES ALLOWED (REMOVE THIS ROW)"
-    )
-    cardinality["node_id"] = "1"
-    cardinality["uid"] = "1"
-    cardinality["langcode"] = "1"
-    cardinality["created"] = "1"
-    cardinality["title"] = "1"
-    for field_name in field_definitions:
-        if field_definitions[field_name]["cardinality"] == -1:
-            cardinality[field_name] = "unlimited"
-        else:
-            cardinality[field_name] = field_definitions[field_name]["cardinality"]
-
-    cardinality_filtered = collections.OrderedDict()
-    for cardinality_key in cardinality.keys():
-        if cardinality_key in deduped_field_names:
-            cardinality_filtered[cardinality_key] = cardinality[cardinality_key]
-    writer.writerow(cardinality_filtered)
-
-    csv_data = get_csv_data(config)
-
-    row_count = 0
-    for row in csv_data:
-        # Delete expired items from request_cache before processing a row.
-        if config["enable_http_cache"] is True:
-            requests_cache.delete(expired=True)
-
-        output_row = collections.OrderedDict()
-        if not value_is_numeric(row["node_id"]):
-            row["node_id"] = get_nid_from_url_alias(config, row["node_id"])
-        if not ping_node(config, row["node_id"]):
-            if config["progress_bar"] is False:
-                print(
-                    "Node "
-                    + row["node_id"]
-                    + " not found or not "
-                    + "accessible, skipping export."
-                )
-            logging.warning(
-                "Node "
-                + row["node_id"]
-                + " not found or not "
-                + "accessible, skipping export."
-            )
-            continue
-
-        # Get node.
-        url = f"{config['host']}/node/{row['node_id']}?_format=json"
-        response = issue_request(config, "GET", url)
-        if response.status_code == 200:
-            body = json.loads(response.text)
-            if body["type"][0]["target_id"] != config["content_type"]:
-                message = (
-                    f"Node {row['node_id']} not written to output CSV because its content type {body['type'][0]['target_id']}"
-                    + f' does not match the "content_type" configuration setting.'
-                )
-                if config["progress_bar"] is False:
-                    print("Error: " + message)
-                logging.error(message)
-                continue
-
-            for fieldname_to_serialize in deduped_field_names:
-                if (
-                    fieldname_to_serialize in body
-                    and fieldname_to_serialize in field_definitions
-                ):
-                    csv_data = serialize_field_json(
-                        config,
-                        field_definitions,
-                        fieldname_to_serialize,
-                        body[fieldname_to_serialize],
-                    )
-                    output_row[fieldname_to_serialize] = csv_data
-
-            if config["export_file_directory"] is not None:
-                downloaded_file_name = download_file_from_drupal(config, row["node_id"])
-                output_row["file"] = downloaded_file_name
-        else:
-            message = f"Attempt to get node {row['node_id']} returned a {response.status_code} status code."
-            print("  Error: " + message)
-            logging.warning(message)
-            return False
-
-        output_row["node_id"] = row["node_id"]
-        writer.writerow(output_row)
-
-        if config["export_file_directory"] is not None:
-            and_files = f"and file "
-        else:
-            and_files = ""
-        message = f"Exporting data {and_files}for node {row['node_id']} \"{body['title'][0]['value']}\"."
-
-        if config["progress_bar"] is True:
-            row_count += 1
-            row_position = get_percentage(row_count, num_csv_records)
-            pbar(row_position)
-        else:
-            print(message)
-
-        logging.info(message)
-
-    csv_file.close()
+    exporter = CSVExporter(config)
+    csv_file_path = exporter.export()
 
     if config["progress_bar"] is True:
-        pbar(100)
-    else:
-        print("CSV export saved at " + csv_file_path + ".")
+        exporter.pbar(100)
+    print(f"\nCSV export saved at {csv_file_path}")
 
 
 def get_data_from_view():
-    """Retrieve data from a Drupal View via its REST export display.
+    """Retrieve data from a Drupal View via its REST export display."""
+    from workbench_export import ViewExporter
 
-    Note: We won't be able to use the progress_bar option in this task until
-    https://www.drupal.org/project/drupal/issues/2982729 is resolved, since
-    we have no way of knowing how many items are in the View output til then.
-    """
-    message = '"Get data from View" task started using config file ' + args.config + "."
-    print(message)
+    message = f'"Get data from View" task started using config file {args.config}.'
     logging.info(message)
+    print(message)
 
-    view_parameters = (
-        "&".join(config["view_parameters"]) if "view_parameters" in config else ""
-    )
-    view_url = (
-        config["host"]
-        + "/"
-        + config["view_path"].lstrip("/")
-        + "?page=0&"
-        + view_parameters
-    )
-    view_path_status_code = ping_view_endpoint(config, view_url)
-    if view_path_status_code != 200:
-        message = f"Cannot access View at {view_url}."
-        logging.error(
-            message + " HTTP status code is " + str(view_path_status_code) + "."
-        )
-        sys.exit("Error: " + message + " See log for more information.")
+    exporter = ViewExporter(config, args)
+    csv_file_path = exporter.export()
 
-    if config["export_csv_file_path"] is not None:
-        csv_file_path = config["export_csv_file_path"]
-    else:
-        csv_file_path = os.path.join(
-            config["input_dir"],
-            os.path.basename(args.config).split(".")[0]
-            + ".csv_file_with_data_from_view",
-        )
-    if os.path.exists(csv_file_path):
-        os.remove(csv_file_path)
-
-    if config["export_file_directory"] is not None:
-        if not os.path.exists(config["export_csv_file_path"]):
-            try:
-                os.mkdir(config["export_csv_file_path"])
-                os.rmdir(config["export_csv_file_path"])
-            except Exception as e:
-                message = (
-                    'Path in configuration option "export_csv_file_path" ("'
-                    + config["export_csv_file_path"]
-                    + '") is not writable.'
-                )
-                logging.error(message + " " + str(e))
-                sys.exit("Error: " + message + " See log for more detail.")
-
-    field_definitions = get_field_definitions(config, "node")
-
-    if len(config["export_csv_field_list"]) > 0:
-        field_names = config["export_csv_field_list"]
-        # Always include node_id and title.
-        field_names.insert(0, "title")
-        field_names.insert(0, "node_id")
-    else:
-        field_names = []
-        for field_name in field_definitions.keys():
-            if field_name.startswith("field_"):
-                field_names.insert(0, field_name)
-        # Always include node_id and title.
-        field_names.insert(0, "title")
-        field_names.insert(0, "node_id")
-
-    deduped_field_names = list("")
-    [deduped_field_names.append(x) for x in field_names if x not in deduped_field_names]
-
-    if (
-        config["export_file_directory"] is not None
-        and "file" not in deduped_field_names
-    ):
-        deduped_field_names.append("file")
-
-    csv_file = open(csv_file_path, "a+", encoding="utf-8")
-    writer = csv.DictWriter(
-        csv_file, fieldnames=deduped_field_names, lineterminator="\n"
-    )
-    writer.writeheader()
-
-    seen_nids = list()
-
-    view_url = config["host"] + "/" + config["view_path"].lstrip("/") + "?page="
-    # Seed the first page of node IDs.
-    page = 0
-    url = view_url + str(0) + "&" + view_parameters
-    response = issue_request(config, "GET", url)
-    if response.status_code != 200:
-        message = f"Request to View at {url} returned a non-200 status ({response.status_code})."
-        logging.error(message)
-        sys.exit("Error: " + message)
-    nodes = json.loads(response.text)
-    for node in nodes:
-        # Delete expired items from request_cache before processing a row.
-        if config["enable_http_cache"] is True:
-            requests_cache.delete(expired=True)
-
-        if node["nid"][0]["value"] not in seen_nids:
-            if node["type"][0]["target_id"] == config["content_type"]:
-                seen_nids.append(node["nid"][0]["value"])
-                row = dict()
-                row["node_id"] = node["nid"][0]["value"]
-                row["title"] = node["title"][0]["value"]
-
-                if config["export_file_directory"] is not None:
-                    and_files = f"and file "
-                else:
-                    and_files = ""
-                message = f"Exporting data {and_files}for node {row['node_id']} \"{row['title']}\"."
-                print(message)
-                logging.info(message)
-
-                for field_name in deduped_field_names:
-                    if field_name.startswith("field_") and field_name in node:
-                        csv_data = serialize_field_json(
-                            config, field_definitions, field_name, node[field_name]
-                        )
-                        row[field_name] = csv_data
-
-                if config["export_file_directory"] is not None:
-                    downloaded_file_name = download_file_from_drupal(
-                        config, row["node_id"]
-                    )
-                    row["file"] = downloaded_file_name
-
-                writer.writerow(row)
-
-                # Execute node-specific post-export scripts, if any are configured.
-                if "node_post_export" in config and len(config["node_post_export"]) > 0:
-                    for command in config["node_post_export"]:
-                        (
-                            post_task_output,
-                            post_task_return_code,
-                        ) = execute_entity_post_task_script(
-                            command,
-                            args.config,
-                            response.status_code,
-                            json.dumps(node),
-                        )
-                        if post_task_return_code == 0:
-                            logging.info(
-                                "Post node export script "
-                                + command
-                                + " executed successfully."
-                            )
-                        else:
-                            logging.error(
-                                "Post node export script " + command + " failed."
-                            )
-        else:
-            message = (
-                f"Node {node['nid'][0]['value']} not written to output CVS because its content type ("
-                + f"{node['type'][0]['target_id']} does not match the \"content_type\" configuration setting."
-            )
-            print("Warning: " + message)
-            logging.warning(message)
-            continue
-
-    # Loop through the remaining pages of the View output, until we encounter an empty page.
-    while len(nodes) > 0:
-        page += 1
-        url = view_url + str(page) + "&" + view_parameters
-        response = issue_request(config, "GET", url)
-        if response.status_code != 200:
-            message = f"Request to View at {url} returned a non-200 status ({response.status_code}); page {page} of results not written to the output CSV file."
-            logging.error(message)
-            continue
-        nodes = json.loads(response.text)
-        for node in nodes:
-            # Delete expired items from request_cache before processing a row.
-            if config["enable_http_cache"] is True:
-                requests_cache.delete(expired=True)
-
-            if node["nid"][0]["value"] not in seen_nids:
-                if node["type"][0]["target_id"] == config["content_type"]:
-                    seen_nids.append(node["nid"][0]["value"])
-                    row = dict()
-                    row["node_id"] = node["nid"][0]["value"]
-                    row["title"] = node["title"][0]["value"]
-
-                    if config["export_file_directory"] is not None:
-                        and_files = f"and file "
-                    else:
-                        and_files = ""
-                    message = f"Exporting data {and_files}for node {row['node_id']} \"{row['title']}\"."
-                    print(message)
-                    logging.info(message)
-
-                    for field_name in deduped_field_names:
-                        if field_name.startswith("field_") and field_name in node:
-                            csv_data = serialize_field_json(
-                                config, field_definitions, field_name, node[field_name]
-                            )
-                            row[field_name] = csv_data
-
-                    if config["export_file_directory"] is not None:
-                        downloaded_file_name = download_file_from_drupal(
-                            config, row["node_id"]
-                        )
-                        row["file"] = downloaded_file_name
-
-                    writer.writerow(row)
-
-                    # Execute node-specific post-export scripts, if any are configured.
-                    if (
-                        "node_post_export" in config
-                        and len(config["node_post_export"]) > 0
-                    ):
-                        for command in config["node_post_export"]:
-                            (
-                                post_task_output,
-                                post_task_return_code,
-                            ) = execute_entity_post_task_script(
-                                command,
-                                args.config,
-                                response.status_code,
-                                json.dumps(node),
-                            )
-                            if post_task_return_code == 0:
-                                logging.info(
-                                    "Post node export script "
-                                    + command
-                                    + " executed successfully."
-                                )
-                            else:
-                                logging.error(
-                                    "Post node export script " + command + " failed."
-                                )
-                else:
-                    message = (
-                        f"Node {node['nid'][0]['value']} not written to output CVS because its content type ("
-                        + f"{node['type'][0]['target_id']} does not match the \"content_type\" configuration setting."
-                    )
-                    print("Warning: " + message)
-                    logging.warning(message)
-                    continue
-
-    csv_file.close()
     message = "CSV file is available at " + csv_file_path + "."
     logging.info(message)
     print(message)
@@ -3113,7 +2844,6 @@ def update_terms():
     )
     csv_data = get_csv_data(config)
     csv_column_headers = csv_data.fieldnames
-    # invalid_target_ids = []
 
     if config["log_term_creation"] is False:
         logging.info(
@@ -3144,13 +2874,13 @@ def update_terms():
         if term_ping_result is False:
             if config["progress_bar"] is False:
                 print(
-                    "Term "
-                    + row["term_name"]
+                    "Warning: Term "
+                    + row["term_id"]
                     + " not found or not accessible, skipping update."
                 )
             logging.warning(
                 "Term "
-                + row["term_name"]
+                + row["term_id"]
                 + " not found or not accessible, skipping update."
             )
             continue
@@ -3184,13 +2914,23 @@ def update_terms():
             if len(row["description"].strip()) != 0:
                 term["description"] = [{"value": row["description"]}]
 
+        if "published" in csv_column_headers:
+            if len(row["published"].strip()) != 0:
+                term["status"] = [{"value": row["published"]}]
+
         # Add custom (non-required) fields.
         required_fields = ["term_id"]
         custom_fields = list(set(csv_column_headers) - set(required_fields))
         for custom_field in custom_fields:
             term_has_all_fields = True
             # If node doesn't have the field, log that fact and skip updating the field.
-            reserved_fields = ["parent", "weight", "description", "term_name"]
+            reserved_fields = [
+                "parent",
+                "weight",
+                "description",
+                "term_name",
+                "published",
+            ]
             if (
                 custom_field not in json.loads(term_response.text)
                 and custom_field not in reserved_fields
@@ -3217,6 +2957,10 @@ def update_terms():
             if custom_field == "description":
                 continue
 
+            # 'published' is a reserved CSV field.
+            if custom_field == "published":
+                continue
+
             # Assemble Drupal field structures from CSV data. If new field types are added to
             # workbench_fields.py, they need to be registered in the following if/elif/else block.
 
@@ -3224,6 +2968,23 @@ def update_terms():
             if field_definitions[custom_field]["field_type"] == "entity_reference":
                 entity_reference_field = workbench_fields.EntityReferenceField()
                 term = entity_reference_field.update(
+                    config,
+                    field_definitions,
+                    term,
+                    row,
+                    custom_field,
+                    term_field_values[custom_field],
+                )
+
+            # Entity reference revision fields (paragraphs).
+            elif (
+                field_definitions[custom_field]["field_type"]
+                == "entity_reference_revisions"
+            ):
+                entity_reference_revisions_field = (
+                    workbench_fields.EntityReferenceRevisionsField()
+                )
+                term = entity_reference_revisions_field.update(
                     config,
                     field_definitions,
                     term,
@@ -3314,6 +3075,19 @@ def update_terms():
                     "Term %s updated.",
                     config["host"] + "/taxonomy/term/" + row["term_id"],
                 )
+            else:
+                message = (
+                    f'Term {config["host"]}/taxonomy/term/{row["term_id"]} not updated.'
+                )
+                print("Warning: " + message)
+                logging.warning(
+                    f"{message} HTTP response code was {term_response.status_code}. Response body was {term_response.text}."
+                )
+                logging.error(
+                    'JSON request body used in previous PATCH to "%s" was %s.',
+                    term_endpoint,
+                    term,
+                )
 
             if config["progress_bar"] is True:
                 row_count += 1
@@ -3342,6 +3116,18 @@ def create_redirects():
             requests_cache.delete(expired=True)
 
         redirect_row_count += 1
+
+        if len(row["redirect_source"].strip()) == 0:
+            message = f"Redirect source value in input CSV row {redirect_row_count} is empty. Skipping."
+            print("Warning: " + message)
+            logging.warning(message)
+            continue
+
+        if len(row["redirect_target"].strip()) == 0:
+            message = f"Redirect target value in input CSV row {redirect_row_count} is empty. Skipping."
+            print("Warning: " + message)
+            logging.warning(message)
+            continue
 
         if row["redirect_source"].lower().startswith("http"):
             message = (
@@ -3448,10 +3234,53 @@ parser.add_argument(
     "--contactsheet", help="Generate a contact sheet.", action="store_true"
 )
 parser.add_argument(
+    "--print_config",
+    help="Prints out the current configuration settings.",
+    action="store_true",
+)
+parser.add_argument(
     "--skip_user_prompts",
     help='Include to skip any user prompts defined in your config file\'s "user_prompts" setting.',
     action="store_true",
 )
+parser.add_argument(
+    "--input_csv",
+    help="Overrides the 'input_csv' configuration setting.",
+)
+parser.add_argument(
+    "--input_dir",
+    help="Overrides the 'input_dir' configuration setting.",
+)
+parser.add_argument(
+    "--google_sheets_gid",
+    help="Overrides the 'google_sheets_gid' configuration setting.",
+)
+parser.add_argument(
+    "--log_file_path",
+    help="Overrides the 'log_file_path' configuration setting.",
+)
+parser.add_argument(
+    "--rollback_config_file_path",
+    help="Overrides the 'rollback_config_file_path' configuration setting.",
+)
+parser.add_argument(
+    "--rollback_csv_file_path",
+    help="Overrides the 'rollback_csv_file_path' configuration setting.",
+)
+parser.add_argument(
+    "--csv_start_row",
+    help="Overrides the 'csv_start_row' configuration setting.",
+)
+parser.add_argument(
+    "--csv_stop_row",
+    help="Overrides the 'csv_stop_row' configuration setting.",
+)
+parser.add_argument(
+    "--recovery_mode_starting_from_node_id",
+    help="Overrides the 'recovery_mode_starting_from_node_id' configuration setting.",
+)
+
+
 parser.add_argument("--version", action="version", version="Islandora Workbench 0.0.0")
 args = parser.parse_args()
 
@@ -3470,6 +3299,54 @@ except Exception as e:
     )
     sys.exit(str(e))
 config = workbench_config.get_config()
+
+if config["remove_password_from_config_file"] is True:
+    with open(config["config_file"], "r+") as config_file_to_remove_password_from_fh:
+        config_file_contents = config_file_to_remove_password_from_fh.readlines()
+        config_file_contents = [
+            line for line in config_file_contents if not line.startswith("password")
+        ]
+        config_file_to_remove_password_from_fh.seek(0)
+        config_file_to_remove_password_from_fh.writelines(config_file_contents)
+        config_file_to_remove_password_from_fh.truncate()
+
+# Override configuration settings that are provided as command-line arguments.
+if args.input_csv is not None:
+    config["input_csv"] = args.input_csv
+if args.input_csv is not None:
+    config["google_sheets_gid"] = args.google_sheets_gid
+if args.input_dir is not None:
+    config["input_dir"] = args.input_dir
+if args.log_file_path is not None:
+    config["log_file_path"] = args.log_file_path
+if args.rollback_config_file_path is not None:
+    config["rollback_config_file_path"] = args.rollback_config_file_path
+if args.rollback_csv_file_path is not None:
+    config["rollback_csv_file_path"] = args.rollback_csv_file_path
+if args.csv_start_row is not None:
+    config["csv_start_row"] = int(args.csv_start_row)
+if args.csv_stop_row is not None:
+    config["csv_stop_row"] = int(args.csv_stop_row)
+if args.recovery_mode_starting_from_node_id is not None:
+    config["recovery_mode_starting_from_node_id"] = (
+        args.recovery_mode_starting_from_node_id
+    )
+
+
+if args.print_config is True:
+    print("\nCurrent Islandora Workbench configuration, including defaults")
+    table = Table()
+    table.add_column("Config setting", justify="left")
+    table.add_column("Value", justify="left")
+    for key, value in config.items():
+        if key == "password":
+            table.add_row(key, "xxxxxxxxxx")
+        else:
+            table.add_row(key, str(value))
+
+    console = Console()
+    console.print(table)
+    sys.exit()
 
 if args.check is not True and config["remind_user_to_run_check"] is True:
     if args.skip_user_prompts is not True:
@@ -3610,7 +3487,45 @@ logging.info(message)
 
 check_drupal_core_version(config)
 
-csv_subset_warning(config)
+if config["task"] in ["create", "update"]:
+    csv_subset_warning(config)
+
+if config["task"] in ["create", "create_from_files"]:
+    logging.info(
+        f'Using the CSV ID to node ID map at "{config["csv_id_to_node_id_map_path"]}".'
+    )
+    if (
+        config["recovery_mode_starting_from_node_id"] is not False
+        and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+    ):
+        query = "select * from csv_id_to_node_id_map where config_file = ?"
+        values = (config["config_file"],)
+        csv_id_map_result = sqlite_manager(
+            config,
+            operation="select",
+            query=query,
+            values=values,
+            db_file_path=config["csv_id_to_node_id_map_path"],
+        )
+        if len(csv_id_map_result) > 0:
+            last_csv_id = str(csv_id_map_result[-1][4])
+            last_node_id = str(csv_id_map_result[-1][5])
+            print(last_csv_id, "/", last_node_id)
+            in_map_message = (
+                f'Nodes for {len(csv_id_map_result)} rows in the input CSV "{config["input_csv"]}" have already been created '
+                + f'(last entry in the CSV ID to node ID map is for CSV row "{last_csv_id}" at {config["host"]}/node/{last_node_id}).'
+            )
+        else:
+            in_map_message = f'Cannot find any entries in the CSV ID to node ID map created using the configuration file "{config["config_file"]}".'
+
+        message = (
+            f'"recovery_mode" option in effect. Items that have already been ingested with node IDs starting at '
+            + f'{config["recovery_mode_starting_from_node_id"]} will be skipped.'
+        )
+        print(message)
+        logging.info(message)
+        print(in_map_message)
+        logging.info(in_map_message)
 
 # Apparently, there's no built-in way of getting the number of items in a
 # DictReader, so we read the CSV file, convert it to a list, and get its length.
@@ -3718,6 +3633,10 @@ try:
         os.environ.pop("ISLANDORA_WORKBENCH_PRIMARY_TASK_TEMP_DIR")
     if os.environ.get("ISLANDORA_WORKBENCH_SECONDARY_TASKS") is not None:
         os.environ.pop("ISLANDORA_WORKBENCH_SECONDARY_TASKS")
+
+    if config["completion_message"] is not None:
+        print(config["completion_message"])
+        logging.info(config["completion_message"])
 
 
 except KeyboardInterrupt:

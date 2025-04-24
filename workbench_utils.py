@@ -1,5 +1,4 @@
-"""Utility functions for Islandora Workbench.
-"""
+"""Utility functions for Islandora Workbench."""
 
 import os
 import sys
@@ -16,6 +15,8 @@ import random
 import uuid
 import datetime
 import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 import subprocess
 import hashlib
 import mimetypes
@@ -79,6 +80,14 @@ def set_media_type(config, filepath, file_fieldname, csv_row):
     """
     if "media_type" in config:
         return config["media_type"]
+    if config["media_type_by_media_use"] and len(config["media_type_by_media_use"]) > 0:
+        additional_files = get_additional_files_config(config)
+        media_url = additional_files.get(file_fieldname)
+        if file_fieldname in additional_files:
+            for entry in config["media_type_by_media_use"]:
+                for key, value in entry.items():
+                    if key == media_url:
+                        return value
 
     # Determine if the incomtimg filepath matches a registered eEmbed media type.
     oembed_media_type = get_oembed_url_media_type(config, filepath)
@@ -228,175 +237,203 @@ def issue_request(config, method, path, headers=None, json="", data="", query=No
     -------
     requests.Response
     """
-    if config["secure_ssl_only"] is False:
-        requests.packages.urllib3.disable_warnings()
-
-    if not config["password"]:
-        message = (
-            'Password for Drupal user not found. Please add the "password" option to your configuration '
-            + "file or provide the Drupal user's password in your ISLANDORA_WORKBENCH_PASSWORD environment variable."
+    with requests.Session() as session:
+        retries = Retry(
+            total=config["http_max_retries"],
+            backoff_factor=config["http_backoff_factor"],
+            status_forcelist=config["http_retry_on_status_codes"],
+            allowed_methods=config["http_retry_allowed_methods"],
         )
-        logging.error(message)
-        sys.exit("Error: " + message)
+        session.mount("http://", HTTPAdapter(max_retries=retries))
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+        try:
+            if config["secure_ssl_only"] is False:
+                requests.packages.urllib3.disable_warnings()
 
-    if config["check"] is False:
-        if (
-            "pause" in config
-            and method in ["POST", "PUT", "PATCH", "DELETE"]
-            and value_is_numeric(config["pause"])
-        ):
-            time.sleep(int(config["pause"]))
+            if not config["password"]:
+                message = (
+                    'Password for Drupal user not found. Please add the "password" option to your configuration '
+                    + "file or provide the Drupal user's password in your ISLANDORA_WORKBENCH_PASSWORD environment variable."
+                )
+                logging.error(message)
+                sys.exit("Error: " + message)
 
-    if headers is None:
-        headers = dict()
+            if config["check"] is False:
+                if (
+                    "pause" in config
+                    # and method in ["POST", "PUT", "PATCH", "DELETE"]
+                    and value_is_numeric(config["pause"])
+                ):
+                    time.sleep(int(config["pause"]))
 
-    if query is None:
-        query = dict()
+            if headers is None:
+                headers = dict()
 
-    headers.update({"User-Agent": config["user_agent"]})
+            if query is None:
+                query = dict()
 
-    # The trailing / is stripped in config, but we do it here too, just in case.
-    config["host"] = config["host"].rstrip("/")
-    if config["host"] in path:
-        url = path
-    else:
-        # Since we remove the trailing / from the hostname, we need to ensure
-        # that there is a / separating the host from the path.
-        if not path.startswith("/"):
-            path = "/" + path
-        url = config["host"] + path
+            headers.update({"User-Agent": config["user_agent"]})
 
-    if config["log_request_url"] is True:
-        logging.info(method + " " + url)
+            # The trailing / is stripped in config, but we do it here too, just in case.
+            config["host"] = config["host"].rstrip("/")
+            if config["host"] in path:
+                url = path
+            else:
+                # Since we remove the trailing / from the hostname, we need to ensure
+                # that there is a / separating the host from the path.
+                if not path.startswith("/"):
+                    path = "/" + path
+                url = config["host"] + path
 
-    if method == "GET":
-        if config["log_headers"] is True:
-            logging.info(headers)
-        response = requests.get(
-            url,
-            allow_redirects=config["allow_redirects"],
-            verify=config["secure_ssl_only"],
-            auth=(config["username"], config["password"]),
-            params=query,
-            headers=headers,
-        )
-    if method == "HEAD":
-        if config["log_headers"] is True:
-            logging.info(headers)
-        response = requests.head(
-            url,
-            allow_redirects=config["allow_redirects"],
-            verify=config["secure_ssl_only"],
-            auth=(config["username"], config["password"]),
-            headers=headers,
-        )
-    if method == "POST":
-        if config["log_headers"] is True:
-            logging.info(headers)
-        if config["log_json"] is True:
-            logging.info(json)
-        response = requests.post(
-            url,
-            allow_redirects=config["allow_redirects"],
-            stream=True,
-            verify=config["secure_ssl_only"],
-            auth=(config["username"], config["password"]),
-            headers=headers,
-            json=json,
-            data=data,
-        )
-    if method == "PUT":
-        if config["log_headers"] is True:
-            logging.info(headers)
-        if config["log_json"] is True:
-            logging.info(json)
-        response = requests.put(
-            url,
-            allow_redirects=config["allow_redirects"],
-            stream=True,
-            verify=config["secure_ssl_only"],
-            auth=(config["username"], config["password"]),
-            headers=headers,
-            json=json,
-            data=data,
-        )
-    if method == "PATCH":
-        if config["log_headers"] is True:
-            logging.info(headers)
-        if config["log_json"] is True:
-            logging.info(json)
-        response = requests.patch(
-            url,
-            allow_redirects=config["allow_redirects"],
-            stream=True,
-            verify=config["secure_ssl_only"],
-            auth=(config["username"], config["password"]),
-            headers=headers,
-            json=json,
-            data=data,
-        )
-    if method == "DELETE":
-        if config["log_headers"] is True:
-            logging.info(headers)
-        response = requests.delete(
-            url,
-            allow_redirects=config["allow_redirects"],
-            verify=config["secure_ssl_only"],
-            auth=(config["username"], config["password"]),
-            headers=headers,
-        )
+            if config["log_request_url"] is True:
+                logging.info(method + " " + url)
 
-    if config["log_response_status_code"] is True:
-        logging.info(response.status_code)
+            if method == "GET":
+                if config["log_headers"] is True:
+                    logging.info(headers)
+                response = session.get(
+                    url,
+                    allow_redirects=config["allow_redirects"],
+                    verify=config["secure_ssl_only"],
+                    auth=(config["username"], config["password"]),
+                    params=query,
+                    headers=headers,
+                )
+            if method == "HEAD":
+                if config["log_headers"] is True:
+                    logging.info(headers)
+                response = session.head(
+                    url,
+                    allow_redirects=config["allow_redirects"],
+                    verify=config["secure_ssl_only"],
+                    auth=(config["username"], config["password"]),
+                    headers=headers,
+                )
+            if method == "POST":
+                if config["log_headers"] is True:
+                    logging.info(headers)
+                if config["log_json"] is True:
+                    logging.info(json)
+                response = session.post(
+                    url,
+                    allow_redirects=config["allow_redirects"],
+                    stream=True,
+                    verify=config["secure_ssl_only"],
+                    auth=(config["username"], config["password"]),
+                    headers=headers,
+                    json=json,
+                    data=data,
+                )
+            if method == "PUT":
+                if config["log_headers"] is True:
+                    logging.info(headers)
+                if config["log_json"] is True:
+                    logging.info(json)
+                response = session.put(
+                    url,
+                    allow_redirects=config["allow_redirects"],
+                    stream=True,
+                    verify=config["secure_ssl_only"],
+                    auth=(config["username"], config["password"]),
+                    headers=headers,
+                    json=json,
+                    data=data,
+                )
+            if method == "PATCH":
+                if config["log_headers"] is True:
+                    logging.info(headers)
+                if config["log_json"] is True:
+                    logging.info(json)
+                response = session.patch(
+                    url,
+                    allow_redirects=config["allow_redirects"],
+                    stream=True,
+                    verify=config["secure_ssl_only"],
+                    auth=(config["username"], config["password"]),
+                    headers=headers,
+                    json=json,
+                    data=data,
+                )
+            if method == "DELETE":
+                if config["log_headers"] is True:
+                    logging.info(headers)
+                response = session.delete(
+                    url,
+                    allow_redirects=config["allow_redirects"],
+                    verify=config["secure_ssl_only"],
+                    auth=(config["username"], config["password"]),
+                    headers=headers,
+                )
 
-    if config["log_response_body"] is True:
-        logging.info(response.text)
+            if config["log_response_status_code"] is True:
+                logging.info(response.status_code)
 
-    response_time = response.elapsed.total_seconds()
-    average_response_time = calculate_response_time_trend(config, response_time)
+            if config["log_response_body"] is True:
+                logging.info(response.text)
 
-    log_response_time_value = copy.copy(config["log_response_time"])
-    if "adaptive_pause" in config and value_is_numeric(config["adaptive_pause"]):
-        # Pause defined in config['adaptive_pause'] is included in the response time,
-        # so we subtract it to get the "unpaused" response time.
-        if average_response_time is not None and (
-            response_time - int(config["adaptive_pause"])
-        ) > (average_response_time * int(config["adaptive_pause_threshold"])):
-            message = (
-                "HTTP requests paused for "
-                + str(config["adaptive_pause"])
-                + " seconds because request in next log entry "
-                + "exceeded adaptive threshold of "
-                + str(config["adaptive_pause_threshold"])
-                + "."
-            )
-            time.sleep(int(config["adaptive_pause"]))
-            logging.info(message)
-            # Enable response time logging if we surpass the adaptive pause threashold.
-            config["log_response_time"] = True
+            response_time = response.elapsed.total_seconds()
+            average_response_time = calculate_response_time_trend(config, response_time)
 
-    if config["log_response_time"] is True:
-        parsed_query_string = urllib.parse.urlparse(url).query
-        if len(parsed_query_string):
-            url_for_logging = (
-                urllib.parse.urlparse(url).path + "?" + parsed_query_string
-            )
-        else:
-            url_for_logging = urllib.parse.urlparse(url).path
-        if "adaptive_pause" in config and value_is_numeric(config["adaptive_pause"]):
-            response_time = response_time - int(config["adaptive_pause"])
-        response_time_trend_entry = {
-            "method": method,
-            "response": response.status_code,
-            "url": url_for_logging,
-            "response_time": response_time,
-            "average_response_time": average_response_time,
-        }
-        logging.info(response_time_trend_entry)
-        # Set this config option back to what it was before we updated in above.
-        config["log_response_time"] = log_response_time_value
+            log_response_time_value = copy.copy(config["log_response_time"])
+            if "adaptive_pause" in config and value_is_numeric(
+                config["adaptive_pause"]
+            ):
+                # Pause defined in config['adaptive_pause'] is included in the response time,
+                # so we subtract it to get the "unpaused" response time.
+                if average_response_time is not None and (
+                    response_time - int(config["adaptive_pause"])
+                ) > (average_response_time * int(config["adaptive_pause_threshold"])):
+                    message = (
+                        "HTTP requests paused for "
+                        + str(config["adaptive_pause"])
+                        + " seconds because request in next log entry "
+                        + "exceeded adaptive threshold of "
+                        + str(config["adaptive_pause_threshold"])
+                        + "."
+                    )
+                    time.sleep(int(config["adaptive_pause"]))
+                    logging.info(message)
+                    # Enable response time logging if we surpass the adaptive pause threashold.
+                    config["log_response_time"] = True
 
-    return response
+            if config["log_response_time"] is True:
+                parsed_query_string = urllib.parse.urlparse(url).query
+                if len(parsed_query_string):
+                    url_for_logging = (
+                        urllib.parse.urlparse(url).path + "?" + parsed_query_string
+                    )
+                else:
+                    url_for_logging = urllib.parse.urlparse(url).path
+                if "adaptive_pause" in config and value_is_numeric(
+                    config["adaptive_pause"]
+                ):
+                    response_time = response_time - int(config["adaptive_pause"])
+                response_time_trend_entry = {
+                    "method": method,
+                    "response": response.status_code,
+                    "url": url_for_logging,
+                    "response_time": response_time,
+                    "average_response_time": average_response_time,
+                }
+                logging.info(response_time_trend_entry)
+                # Set this config option back to what it was before we updated in above.
+                config["log_response_time"] = log_response_time_value
+            return response
+        except requests.exceptions.Timeout as err_timeout:
+            message = f'Workbench timed out while requesting "{url}".'
+            logging.error(message)
+            logging.error(err_timeout)
+            sys.exit("Error: " + message)
+        except requests.exceptions.ConnectionError as error_connection:
+            message = f'Workbench could not connect to {config["host"]} while requesting "{url}".'
+            logging.error(message)
+            logging.error(error_connection)
+            sys.exit("Error: " + message)
+        except requests.exceptions.RequestException as request_error:
+            message = f'Workbench encountered an exception while requesting "{url}".'
+            logging.error(message)
+            logging.error(request_error)
+            sys.exit("Error: " + message)
 
 
 def convert_semver_to_number(version_string):
@@ -1014,11 +1051,12 @@ def ping_remote_file(config, url):
     -------
     int|None
     """
+    headers = {"User-Agent": config["user_agent"]}
 
     sections = urllib.parse.urlparse(url)
     try:
         response = requests.head(
-            url, allow_redirects=True, verify=config["secure_ssl_only"]
+            url, allow_redirects=True, verify=config["secure_ssl_only"], headers=headers
         )
         return response.status_code
     except requests.exceptions.Timeout as err_timeout:
@@ -1065,6 +1103,14 @@ def get_nid_from_url_alias(config, url_alias_to_query):
         return False
 
     if url_alias_to_query.startswith("http") is True:
+        # Drupal sometimes returns "http://" instead of "https://" in the "location"
+        # response header. Check for that and replace it if necessary.
+        if url_alias_to_query.startswith("http://") and config["host"].startswith(
+            "https://"
+        ):
+            url_alias_to_query = re.sub(
+                r"^http://", "https://", url_alias_to_query, flags=re.IGNORECASE
+            )
         alias_query_url = f"{url_alias_to_query}?_format=json"
     else:
         alias_query_url = (
@@ -1094,6 +1140,11 @@ def get_mid_from_media_url_alias(config, url_alias):
     int|boolean
         The media ID, or False if the URL cannot be found.
     """
+    # Drupal sometimes returns "http://" instead of "https://" in the "location"
+    # response header. Check for that and replace it if necessary.
+    if url_alias.startswith("http://") and config["host"].startswith("https://"):
+        url_alias = re.sub(r"^http://", "https://", url_alias, flags=re.IGNORECASE)
+
     url = url_alias + "?_format=json"
     response = issue_request(config, "GET", url)
     if response.status_code != 200:
@@ -1104,7 +1155,7 @@ def get_mid_from_media_url_alias(config, url_alias):
 
 
 def get_nid_from_url_without_config(url):
-    """Gets a node ID from a raw URL, with no accompanying config data. Useful
+    """Gets a node ID from a raw Drupal URL, with no accompanying config data. Useful
        within integration tests where the config is not directly accessible.
 
     Parameters
@@ -1117,7 +1168,7 @@ def get_nid_from_url_without_config(url):
         The node ID, or False if the URL cannot be found.
     """
     url = url + "?_format=json"
-    response = requests.get(url)
+    response = requests.get(url, verify=False)
     if response.status_code != 200:
         return False
     else:
@@ -1863,6 +1914,19 @@ def check_input(config, args):
     config_keys = list(config.keys())
     config_keys.remove("check")
 
+    if config["task"] in ["create", "create_from_files"]:
+        if config["csv_id_to_node_id_map_dir"] == config["temp_dir"]:
+            message = f'You should set your "csv_id_to_node_id_map_dir" config setting to a location other than your system\'s temporary directory.'
+            print("Warning: " + message)
+            logging.warning(message)
+        if (
+            config["recovery_mode_starting_from_node_id"] is not False
+            and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+        ):
+            message = f'"recovery_mode" option in effect. Items that have already been ingested with node IDs starting at {config["recovery_mode_starting_from_node_id"]} will be skipped.'
+            print(message)
+            logging.info(message)
+
     # Check for presence of required config keys, which varies by task.
     if config["task"] == "create":
         if config["nodes_only"] is True:
@@ -2050,6 +2114,10 @@ def check_input(config, args):
     message = "OK, configuration file has all required values (did not check for optional values)."
     print(message)
     logging.info(message)
+
+    # Check that the rollback configuration file and CSV file directories exist and are writable.
+    if config["task"] in ["create", "create_from_files"]:
+        check_rollback_file_path_directories(config)
 
     create_temp_dir(config)
 
@@ -2339,7 +2407,7 @@ def check_input(config, args):
         # in the CSV file 'field_member_of' is mandatory.
         if "parent_id" in csv_column_headers:
             if "field_weight" not in csv_column_headers:
-                message = 'If ingesting paged content, or compound objects where order is required a "field_weight" column is required.'
+                message = 'If you are ingesting compound objects, a "field_weight" column is required in your input CSV file.'
                 logging.info(message)
             if "field_member_of" not in csv_column_headers:
                 message = 'If your CSV file contains a "parent_id" column, it must also contain a "field_member_of" column (with empty values in child rows).'
@@ -2780,6 +2848,7 @@ def check_input(config, args):
             "parent",
             "weight",
             "description",
+            "published",
         ]
         drupal_fieldnames = []
         for drupal_fieldname in field_definitions:
@@ -3096,6 +3165,18 @@ def check_input(config, args):
 
         check_for_redirects_csv_data = get_csv_data(config)
         for count, row in enumerate(check_for_redirects_csv_data, start=1):
+            if len(row["redirect_source"].strip()) == 0:
+                message = f"Redirect source value in input CSV row {count} is empty. Redirect will not be created."
+                logging.warning(message)
+                warnings_about_redirect_input_csv = True
+                continue
+
+            if len(row["redirect_target"].strip()) == 0:
+                message = f"Redirect target value in input CSV row {count} is empty. Redirect will not be created."
+                logging.warning(message)
+                warnings_about_redirect_input_csv = True
+                continue
+
             if row["redirect_source"].lower().startswith("http"):
                 message = (
                     'Redirect source values cannot contain a hostname, they must be a path only, without a hostname. Please correct "'
@@ -3150,10 +3231,9 @@ def check_input(config, args):
                     + str(count)
                     + ") does not exist (HTTP response code is "
                     + str(path_exists_response.status_code)
-                    + ")."
+                    + ") so is available as a redirect."
                 )
-                logging.warning(message)
-                warnings_about_redirect_input_csv = True
+                logging.info(message)
                 continue
             else:
                 # We've already tested for 3xx responses, so assume that the path exists.
@@ -3423,7 +3503,7 @@ def check_input(config, args):
                     ].strip()
                     if len(file_check_row[additional_file_field]) == 0:
                         message = (
-                            "CVS row with ID "
+                            "CSV row with ID "
                             + file_check_row[config["id_field"]]
                             + ' contains an empty value in its "'
                             + additional_file_field
@@ -3611,7 +3691,7 @@ def check_input(config, args):
             ):
                 message = (
                     'If your configuration contains the "paged_content_additional_page_media" setting, it must also include both '
-                    + 'the "paged_content_image_file_extension" and "paged_content_additional_page_media" settings.s.'
+                    + 'the "paged_content_image_file_extension" and "paged_content_additional_page_media" settings.'
                 )
                 logging.error(message)
                 sys.exit("Error: " + message)
@@ -3639,19 +3719,81 @@ def check_input(config, args):
                 message = "Page directory " + dir_path + " is empty."
                 print("Warning: " + message)
                 logging.warning(message)
+
             for page_file_name in page_files:
-                if config["paged_content_sequence_separator"] not in page_file_name:
-                    message = (
-                        "Page file "
-                        + os.path.join(dir_path, page_file_name)
-                        + " does not contain a sequence separator ("
-                        + config["paged_content_sequence_separator"]
-                        + ")."
-                    )
-                    logging.error(message)
-                    sys.exit("Error: " + message)
+                # Only want files, not directories.
+                if os.path.isdir(os.path.join(dir_path, page_file_name)):
+                    continue
+
+                if page_file_name.strip().lower() not in [
+                    fn.strip().lower() for fn in config["paged_content_ignore_files"]
+                ]:
+                    if config["paged_content_sequence_separator"] not in page_file_name:
+                        message = (
+                            "Page file "
+                            + os.path.join(dir_path, page_file_name)
+                            + " does not contain a sequence separator ("
+                            + config["paged_content_sequence_separator"]
+                            + ")."
+                        )
+                        logging.error(message)
+                        sys.exit("Error: " + message)
+
+            # Check additional page media files (e.g. OCR andhOCR files) for utf8 encoding.
+            additional_page_media_no_utf8_warnings = list()
+            if config["paged_content_from_directories"] is True:
+                if "paged_content_additional_page_media" in config:
+                    for extension_mapping in config[
+                        "paged_content_additional_page_media"
+                    ]:
+                        for (
+                            additional_page_media_use_term,
+                            additional_page_media_extension,
+                        ) in extension_mapping.items():
+                            for page_file_name in page_files:
+                                page_file_base_path, page_file_extension = (
+                                    os.path.splitext(page_file_name)
+                                )
+                                if (
+                                    page_file_extension.lstrip(".")
+                                    == additional_page_media_extension
+                                ):
+                                    additional_page_media_file_path = os.path.join(
+                                        dir_path,
+                                        page_file_base_path
+                                        + "."
+                                        + additional_page_media_extension.strip(),
+                                    )
+                                    if check_file_exists(
+                                        config, additional_page_media_file_path
+                                    ):
+                                        if (
+                                            file_is_utf8(
+                                                additional_page_media_file_path
+                                            )
+                                            is False
+                                        ):
+                                            message = (
+                                                'Additional page/child media file "'
+                                                + additional_page_media_file_path
+                                                + '" in directory for row ID "'
+                                                + row[config["id_field"]]
+                                                + '" is not encoded as UTF-8 so will not be ingested.'
+                                            )
+                                            if (
+                                                additional_page_media_file_path
+                                                not in additional_page_media_no_utf8_warnings
+                                            ):
+                                                logging.warning(message)
+                                                additional_page_media_no_utf8_warnings.append(
+                                                    additional_page_media_file_path
+                                                )
 
         print("OK, page directories are all present.")
+        if len(additional_page_media_no_utf8_warnings) > 0:
+            print(
+                "Warning: Check your Workbench log for entries about UTF-8 encoding of additional page/child files."
+            )
 
     # Check for bootstrap scripts, if any are configured.
     bootsrap_scripts_present = False
@@ -3877,6 +4019,34 @@ def check_input(config, args):
             output = subprocess.run(cmd)
 
         sys.exit(0)
+
+
+def check_rollback_file_path_directories(config):
+    rollback_config_file_path = get_rollback_config_filepath(config)
+    rollback_config_file_path_head, rollback_config_file_path_tail = os.path.split(
+        rollback_config_file_path
+    )
+    if not os.access(rollback_config_file_path_head, os.W_OK):
+        message = f'Directory "{rollback_config_file_path_head}" in the rollback configuration file path does not exist or is not writable.'
+        logging.error(message)
+        sys.exit("Error: " + message)
+
+    if config["check"] is True:
+        logging.info(
+            f"Rollback configuration file will be written to {rollback_config_file_path}."
+        )
+
+    rollback_csv_file_path = get_rollback_csv_filepath(config)
+    rollback_csv_file_path_head, rollback_csv_file_path_tail = os.path.split(
+        rollback_csv_file_path
+    )
+    if not os.access(rollback_csv_file_path_head, os.W_OK):
+        message = f'Directory "{rollback_csv_file_path_head}" in the rollback CSV file path does not exist or is not writable.'
+        logging.error(message)
+        sys.exit("Error: " + message)
+
+    if config["check"] is True:
+        logging.info(f"Rollback CSV file will be written to {rollback_csv_file_path}.")
 
 
 def get_registered_media_extensions(config, media_bundle, field_name_filter=None):
@@ -5207,15 +5377,21 @@ def create_media(
                 media_json[media_field][0]["alt"] = alt_text
 
         # extracted_text media must have their field_edited_text field populated for full text indexing.
+        # Text must be encoded as utf-8.
         if media_type == "extracted_text":
             if check_file_exists(config, filename):
                 media_json["field_edited_text"] = list()
                 if os.path.isabs(filename) is False:
                     filename = os.path.join(config["input_dir"], filename)
-                extracted_text_file = open(filename, "r", -1, "utf-8")
-                media_json["field_edited_text"].append(
-                    {"value": extracted_text_file.read()}
-                )
+                try:
+                    extracted_text_file = open(filename, "r", -1, "utf-8-sig")
+                    media_json["field_edited_text"].append(
+                        {"value": extracted_text_file.read()}
+                    )
+                except Exception as e:
+                    logging.error(
+                        f'Extracted text file "{filename}" caused a problem that prevented it from being ingested ({e}).'
+                    )
             else:
                 logging.error("Extracted text file %s not found.", filename)
 
@@ -5344,17 +5520,25 @@ def create_media(
                     media_track_field_name_parts = (
                         fully_qualified_media_track_field_name.split(":")
                     )
-                    create_track_file_result = create_file(
-                        config,
-                        media_track_entry["file_path"],
-                        fully_qualified_media_track_field_name,
-                        csv_row,
-                        node_id,
-                    )
+                    try:
+                        create_track_file_result = create_file(
+                            config,
+                            media_track_entry["file_path"],
+                            fully_qualified_media_track_field_name,
+                            csv_row,
+                            node_id,
+                        )
+                    except Exception as e:
+                        media_track_entry_file_path = media_track_entry["file_path"]
+                        logging.error(
+                            f'Media track file "{media_track_entry_file_path}" caused a problem that prevented it from being ingested ({e}).'
+                        )
+                        continue
+
                     if create_track_file_result is not False and isinstance(
                         create_track_file_result, int
                     ):
-                        # /entity/file/663?_format=json will return JSON containing the file's 'uri'.
+                        # /entity/file/xxx?_format=json will return JSON containing the file's 'uri'.
                         track_file_info_response = issue_request(
                             config,
                             "GET",
@@ -5861,15 +6045,36 @@ def get_csv_data(config, csv_file_target="node_fields", file_path=None):
         for row in itertools.islice(csv_reader, csv_start_row, config["csv_stop_row"]):
             row_num += 1
 
-            # Skip rows specified not in config['csv_rows_to_process'].
+            csv_rows_to_process_allowed_tasks = ["create", "update"]
+            # Skip rows specified not in config['csv_rows_to_process'] if its value is a path to a file.
             if (
                 "csv_rows_to_process" in config
+                and config["task"] in csv_rows_to_process_allowed_tasks
                 and len(config["csv_rows_to_process"]) > 0
+                and isinstance(config["csv_rows_to_process"], str)
+            ):
+                path_to_ids_file = os.path.abspath(config["csv_rows_to_process"])
+                if os.path.exists(path_to_ids_file):
+                    with open(path_to_ids_file) as fh:
+                        ids_to_process = fh.read().splitlines()
+                        ids_to_process = [x for x in ids_to_process if x]
+                else:
+                    message = f'File identified in the "csv_rows_to_process" config setting ({path_to_ids_file}) cannot be found.'
+                    logging.error(message)
+                    sys.exit("Error: " + message)
+                if row[config["id_field"]] not in ids_to_process:
+                    continue
+
+            # Skip rows specified not in config['csv_rows_to_process'] if its value is a list.
+            if (
+                "csv_rows_to_process" in config
+                and config["task"] in csv_rows_to_process_allowed_tasks
+                and len(config["csv_rows_to_process"]) > 0
+                and isinstance(config["csv_rows_to_process"], list)
             ):
                 if row[config["id_field"]] not in config["csv_rows_to_process"]:
                     continue
 
-            # WIP on #812.
             # Apply the "is" and "isnot" csv_row_filters defined defined above.
             # If the field/value combo is in the 'isnot' list, skip this row.
             filter_out_this_csv_row = False
@@ -6479,10 +6684,17 @@ def create_term(config, vocab_id, term_name, term_csv_row=None):
         return tid
     else:
         logging.warning(
-            "Term '%s' not created, HTTP response code was %s.",
+            "Term '%s' not created, HTTP response code was %s, response body was %s.",
             term_name,
             response.status_code,
+            response.text,
         )
+        logging.error(
+            'JSON request body used in previous POST to "%s" was %s.',
+            term_endpoint,
+            term,
+        )
+
         return False
 
 
@@ -6508,9 +6720,18 @@ def get_term_field_data(config, vocab_id, term_name, term_csv_row):
             The dict containing the term field data, or False if this is not possible.
             @note: reason why creating JSON is not possible should be logged in this function.
     """
+    if (
+        term_csv_row is not None
+        and "published" in term_csv_row.keys()
+        and len(term_csv_row["published"]) > 0
+    ):
+        published_status = term_csv_row["published"]
+    else:
+        published_status = True
+
     # 'vid' and 'name' are added in create_term().
     term_field_data = {
-        "status": [{"value": True}],
+        "status": [{"value": published_status}],
         "description": [{"value": "", "format": None}],
         "weight": [{"value": 0}],
         "parent": [{"target_type": "taxonomy_term", "target_id": None}],
@@ -6536,6 +6757,10 @@ def get_term_field_data(config, vocab_id, term_name, term_csv_row):
         for field_name in vocab_csv_column_headers:
             # term_name is the "id" field in the vocabulary CSV and not a field in the term JSON, so skip it.
             if field_name == "term_name":
+                continue
+
+            # "published" is a reserved column name in the vocabulary CSV and not a field in the term JSON, so skip it.
+            if field_name == "published":
                 continue
 
             # 'parent' field is present and not empty, so we need to look up the parent term. All terms
@@ -6603,6 +6828,22 @@ def get_term_field_data(config, vocab_id, term_name, term_csv_row):
             if vocab_field_definitions[field_name]["field_type"] == "entity_reference":
                 entity_reference_field = workbench_fields.EntityReferenceField()
                 term_field_data = entity_reference_field.create(
+                    config,
+                    vocab_field_definitions,
+                    term_field_data,
+                    term_csv_row,
+                    field_name,
+                )
+
+            # Entity reference revision fields (paragraphs).
+            elif (
+                vocab_field_definitions[field_name]["field_type"]
+                == "entity_reference_revisions"
+            ):
+                entity_reference_revisions_field = (
+                    workbench_fields.EntityReferenceRevisionsField()
+                )
+                term_field_data = entity_reference_revisions_field.create(
                     config,
                     vocab_field_definitions,
                     term_field_data,
@@ -7414,6 +7655,19 @@ def validate_media_track_fields(config, csv_data):
                                                 logging.error(message)
                                                 sys.exit("Error: " + message)
 
+                                            if (
+                                                file_is_utf8(media_track_file_path)
+                                                is False
+                                            ):
+                                                message = (
+                                                    'Media track file "'
+                                                    + media_track_file_path_in_csv
+                                                    + '" in row with ID "'
+                                                    + row[config["id_field"]]
+                                                    + '" is not encoded as UTF-8 and will not be ingested.'
+                                                )
+                                                logging.warning(message)
+
     if media_track_fields_present is True:
         message = "OK, media track field values in the CSV file validate."
         print(message)
@@ -7504,7 +7758,7 @@ def validate_authority_link_value(authority_link_value, authority_sources):
         return False
 
 
-def validate_term_name_length(term_name, row_number, column_name):
+def validate_term_name_length(term_name, row_id, column_name):
     """Checks that the length of a term name does not exceed
     Drupal's 255 character length.
     """
@@ -7513,8 +7767,8 @@ def validate_term_name_length(term_name, row_number, column_name):
         message = (
             'CSV field "'
             + column_name
-            + '" in record '
-            + row_number
+            + '" in record with ID '
+            + row_id
             + " contains a taxonomy term that exceeds Drupal's limit of 255 characters (length of term is "
             + str(len(term_name))
             + " characters)."
@@ -7761,7 +8015,7 @@ def validate_parent_ids_in_csv_id_to_node_id_map(config, csv_data):
     else:
         return
 
-    # First, confirm the databae exists; if not, tell the user and exit.
+    # First, confirm the database exists; if not, tell the user and exit.
     if config["csv_id_to_node_id_map_path"] is not False:
         if not os.path.exists(config["csv_id_to_node_id_map_path"]):
             message = f"Can't find CSV ID to node ID database path at {config['csv_id_to_node_id_map_path']}."
@@ -7840,7 +8094,11 @@ def validate_taxonomy_field_values(config, field_definitions, csv_data):
         for column_name in fields_with_vocabularies:
             if len(row[column_name]):
                 new_term_names_in_csv = validate_taxonomy_reference_value(
-                    config, field_definitions, column_name, row[column_name], count
+                    config,
+                    field_definitions,
+                    column_name,
+                    row[column_name],
+                    row[config["id_field"]],
                 )
                 new_term_names_in_csv_results.append(new_term_names_in_csv)
 
@@ -8127,7 +8385,7 @@ def validate_typed_relation_field_values(config, field_definitions, csv_data):
                                 field_definitions,
                                 column_name,
                                 field_value_to_check,
-                                count,
+                                row[config["id_field"]],
                             )
                             new_term_names_in_csv_results.append(new_term_names_in_csv)
 
@@ -8161,7 +8419,7 @@ def validate_typed_relation_field_values(config, field_definitions, csv_data):
 
 
 def validate_taxonomy_reference_value(
-    config, field_definitions, csv_field_name, csv_field_value, record_number
+    config, field_definitions, csv_field_name, csv_field_value, row_id
 ):
     this_fields_vocabularies = get_field_vocabularies(
         config, field_definitions, csv_field_name
@@ -8203,8 +8461,8 @@ def validate_taxonomy_reference_value(
                             + tentative_namespace
                             + '" used in CSV column "'
                             + csv_field_name
-                            + '", row '
-                            + str(record_number)
+                            + '", row with ID '
+                            + str(row_id)
                             + " does not match any of the vocabularies referenced by the"
                             + " corresponding Drupal field ("
                             + this_fields_vocabularies_string
@@ -8221,15 +8479,15 @@ def validate_taxonomy_reference_value(
                     message_2 = (
                         '"'
                         + field_value
-                        + '" in row '
-                        + str(record_number)
+                        + '" in row with ID '
+                        + str(row_id)
                         + " does not have one."
                     )
                     logging.error(message + message_2)
                     sys.exit("Error: " + message + message_2)
 
                 validate_term_name_length(
-                    split_field_value, str(record_number), csv_field_name
+                    split_field_value, str(row_id), csv_field_name
                 )
 
         # Check to see if field_value is a member of the field's vocabularies. First, check whether field_value is a term ID.
@@ -8247,8 +8505,8 @@ def validate_taxonomy_reference_value(
                 message = (
                     'CSV field "'
                     + csv_field_name
-                    + '" in row '
-                    + str(record_number)
+                    + '" in row with ID '
+                    + str(row_id)
                     + " contains a term ID ("
                     + field_value
                     + ") that is "
@@ -8281,8 +8539,8 @@ def validate_taxonomy_reference_value(
                     message = (
                         'CSV field "'
                         + csv_field_name
-                        + '" in row '
-                        + str(record_number)
+                        + '" in row with ID '
+                        + str(row_id)
                         + " contains a term URI ("
                         + field_value
                         + ") that is "
@@ -8307,8 +8565,8 @@ def validate_taxonomy_reference_value(
                     + field_value
                     + '" used in CSV column "'
                     + csv_field_name
-                    + '" row '
-                    + str(record_number)
+                    + '" row with ID '
+                    + str(row_id)
                     + " does not match any terms."
                 )
                 logging.error(message)
@@ -8326,13 +8584,13 @@ def validate_taxonomy_reference_value(
                             if tid is False:
                                 new_term_names_in_csv = True
                                 validate_term_name_length(
-                                    field_value, str(record_number), csv_field_name
+                                    field_value, str(row_id), csv_field_name
                                 )
                                 message = (
                                     'CSV field "'
                                     + csv_field_name
-                                    + '" in row '
-                                    + str(record_number)
+                                    + '" in row with ID '
+                                    + str(row_id)
                                     + ' contains a term ("'
                                     + field_value.strip()
                                     + '") that is '
@@ -8362,8 +8620,8 @@ def validate_taxonomy_reference_value(
                             message = (
                                 'CSV field "'
                                 + csv_field_name
-                                + '" in row '
-                                + str(record_number)
+                                + '" in row with ID '
+                                + str(row_id)
                                 + ' contains a term ("'
                                 + field_value.strip()
                                 + '") that is '
@@ -8389,8 +8647,8 @@ def validate_taxonomy_reference_value(
                             message = (
                                 'CSV field "'
                                 + csv_field_name
-                                + '" in row '
-                                + str(record_number)
+                                + '" in row with ID '
+                                + str(row_id)
                                 + " contains a namespaced term name "
                             )
                             message_2 = (
@@ -8417,8 +8675,8 @@ def validate_taxonomy_reference_value(
                                 message = (
                                     'CSV field "'
                                     + csv_field_name
-                                    + '" in row '
-                                    + str(record_number)
+                                    + '" in row with ID '
+                                    + str(row_id)
                                     + ' contains a term ("'
                                     + namespaced_term_name.strip()
                                     + '") that is '
@@ -8447,7 +8705,7 @@ def validate_taxonomy_reference_value(
 
                                 validate_term_name_length(
                                     split_field_value,
-                                    str(record_number),
+                                    str(row_id),
                                     csv_field_name,
                                 )
                         # Die if namespaced term name is not specified vocab.
@@ -8456,8 +8714,8 @@ def validate_taxonomy_reference_value(
                                 message = (
                                     'CSV field "'
                                     + csv_field_name
-                                    + '" in row '
-                                    + str(record_number)
+                                    + '" in row with ID '
+                                    + str(row_id)
                                     + ' contains a term ("'
                                     + namespaced_term_name.strip()
                                     + '") that is '
@@ -8474,7 +8732,7 @@ def validate_taxonomy_reference_value(
 
 
 def write_to_output_csv(config, id, node_json, input_csv_row=None):
-    """Appends a row to the CVS file located at config['output_csv']."""
+    """Appends a row to the CSV file located at config['output_csv']."""
     """Parameters
         ----------
         config : dict
@@ -8602,6 +8860,28 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id):
     required_fields = get_required_bundle_fields(config, "node", config["content_type"])
 
     for page_file_name in page_files:
+        if page_file_name.strip().lower() in [
+            fn.strip().lower() for fn in config["paged_content_ignore_files"]
+        ]:
+            continue
+
+        # Only want files, not directories.
+        if os.path.isdir(os.path.join(page_dir_path, page_file_name)):
+            continue
+
+        if (
+            config["recovery_mode_starting_from_node_id"] is not False
+            and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+            and parent_id is not None
+        ):
+            nid_in_map = recovery_mode_id_in_csv_id_to_node_id_map(
+                config, page_file_name, parent_id
+            )
+            if nid_in_map is not False:
+                message = f"Page/child file {page_file_name} has already been ingested at ({config['host']}/node/{nid_in_map}), skipping it."
+                logging.info(message)
+                continue
+
         filename_without_extension = os.path.splitext(page_file_name)[0]
         filename_segments = filename_without_extension.split(
             config["paged_content_sequence_separator"]
@@ -8634,10 +8914,11 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id):
                     paged_items_template_template,
                 ) in paged_items_template.items():
                     if paged_items_template_field_name not in inherited_fields:
-                        inherited_fields.append(paged_items_template_field_name)
-                        csv_row_to_apply_to_paged_children[
-                            paged_items_template_field_name
-                        ] = ""
+                        if paged_items_template_field_name in parent_csv_record:
+                            inherited_fields.append(paged_items_template_field_name)
+                            csv_row_to_apply_to_paged_children[
+                                paged_items_template_field_name
+                            ] = parent_csv_record[paged_items_template_field_name]
 
         if (
             "csv_value_templates_for_paged_content" in config
@@ -8678,10 +8959,61 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id):
                 {"target_id": paged_content_model_tid, "target_type": "taxonomy_term"}
             ]
 
-        if "field_display_hints" in parent_csv_record:
-            node_json["field_display_hints"] = [
+        # Add viewer override if defined in CSV or config.
+        if "paged_content_page_viewer_override" in config:
+            if (
+                value_is_numeric(config["paged_content_page_viewer_override"]) is False
+                and config["paged_content_page_viewer_override"].startswith("http")
+                is True
+            ):
+                page_viewer_override_tid_info = get_all_representations_of_term(
+                    config,
+                    vocab_id="islandora_display",
+                    uri=config["paged_content_page_viewer_override"],
+                )
+                page_viewer_override_tid = page_viewer_override_tid_info["term_id"]
+            elif (
+                value_is_numeric(config["paged_content_page_viewer_override"]) is False
+                and config["paged_content_page_viewer_override"].startswith("http")
+                is False
+            ):
+                page_viewer_override_tid_info = get_all_representations_of_term(
+                    config,
+                    vocab_id="islandora_display",
+                    name=config["paged_content_page_viewer_override"],
+                )
+                page_viewer_override_tid = page_viewer_override_tid_info["term_id"]
+            else:
+                page_viewer_override_tid = config["paged_content_page_viewer_override"]
+
+        viewer_override_fieldname = config["viewer_override_fieldname"]
+        if (
+            viewer_override_fieldname in parent_csv_record
+            and "paged_content_page_viewer_override" in config
+        ):
+            node_json[viewer_override_fieldname] = [
                 {
-                    "target_id": parent_csv_record["field_display_hints"],
+                    "target_id": page_viewer_override_tid,
+                    "target_type": "taxonomy_term",
+                }
+            ]
+        if (
+            viewer_override_fieldname in parent_csv_record
+            and "paged_content_page_viewer_override" not in config
+        ):
+            node_json[viewer_override_fieldname] = [
+                {
+                    "target_id": parent_csv_record["field_viewer_override"],
+                    "target_type": "taxonomy_term",
+                }
+            ]
+        if (
+            viewer_override_fieldname not in parent_csv_record
+            and "paged_content_page_viewer_override" in config
+        ):
+            node_json[viewer_override_fieldname] = [
+                {
+                    "target_id": page_viewer_override_tid,
                     "target_type": "taxonomy_term",
                 }
             ]
@@ -8706,9 +9038,9 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id):
                 if inherited_field in [
                     "title",
                     "field_model",
-                    "field_display_hints",
                     "uid",
                     "created",
+                    config["viewer_override_fieldname"],
                 ]:
                     continue
 
@@ -8779,7 +9111,6 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id):
 
                 # For non-entity reference and non-typed relation fields (text, integer, boolean etc.).
                 else:
-                    # WIP on #791.
                     simple_field = workbench_fields.SimpleField()
                     node_json = simple_field.create(
                         config,
@@ -8802,13 +9133,22 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id):
                 write_to_output_csv(config, page_identifier, node_response.text)
 
             node_nid = get_nid_from_url_alias(config, node_uri)
-            write_rollback_node_id(config, node_nid, path_to_rollback_csv_file)
 
             populate_csv_id_to_node_id_map(
                 config, parent_id, parent_node_id, page_file_name, node_nid
             )
 
             page_file_path = os.path.join(page_dir_name, page_file_name)
+            write_rollback_node_id(
+                config,
+                node_nid,
+                "",
+                page_title,
+                page_file_path,
+                parent_node_id,
+                path_to_rollback_csv_file,
+            )
+
             fake_csv_record = collections.OrderedDict()
             fake_csv_record["title"] = page_title
             fake_csv_record["file"] = page_file_path
@@ -8945,14 +9285,25 @@ def get_rollback_csv_filepath(config):
             config["rollback_csv_filename_template"]
         )
         try:
-            rollback_csv_filename_basename = str(
-                rollback_csv_filename_template.substitute(
-                    {
-                        "config_filename": config_filename,
-                        "input_csv_filename": input_csv_filename,
-                    }
+            if config["task"] == "create":
+                rollback_csv_filename_basename = str(
+                    rollback_csv_filename_template.substitute(
+                        {
+                            "config_filename": config_filename,
+                            "input_csv_filename": input_csv_filename,
+                            "csv_start_row": str(config["csv_start_row"]),
+                            "csv_stop_row": str(config["csv_stop_row"]),
+                        }
+                    )
                 )
-            )
+            if config["task"] == "create_from_files":
+                rollback_csv_filename_basename = str(
+                    rollback_csv_filename_template.substitute(
+                        {
+                            "config_filename": config_filename,
+                        }
+                    )
+                )
         except Exception as e:
             # We need to account for the very common case where the user has included "valid identifier characters"
             # (as defined in https://peps.python.org/pep-0292/) as part of their template. The most common case will
@@ -8967,9 +9318,21 @@ def get_rollback_csv_filepath(config):
     else:
         rollback_csv_filename_basename = "rollback"
 
-    if config["timestamp_rollback"] is True:
+    if config["timestamp_rollback"] is True or (
+        config["recovery_mode_starting_from_node_id"] is not False
+        and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+    ):
         now_string = EXECUTION_START_TIME.strftime("%Y_%m_%d_%H_%M_%S")
+
+    if config["timestamp_rollback"] is True:
         rollback_csv_filename = f"{rollback_csv_filename_basename}.{now_string}.csv"
+    elif (
+        config["recovery_mode_starting_from_node_id"] is not False
+        and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+    ):
+        rollback_csv_filename = (
+            f"{rollback_csv_filename_basename}.{now_string}.recovery_mode.csv"
+        )
     else:
         rollback_csv_filename = f"{rollback_csv_filename_basename}.csv"
 
@@ -8979,12 +9342,30 @@ def get_rollback_csv_filepath(config):
             config_file_id = get_config_file_identifier(config)
             rollback_csv_filename = rollback_csv_filename + "." + config_file_id
 
-    return os.path.join(
-        config["rollback_dir"] or config["input_dir"], rollback_csv_filename
-    )
+    if "rollback_csv_file_path" in config and len(config["rollback_csv_file_path"]) > 0:
+        if config["timestamp_rollback"] is True:
+            rollback_csv_file_path_head, rollback_csv_file_path_tail = os.path.split(
+                config["rollback_csv_file_path"]
+            )
+            rollback_csv_file_basename, rollback_csv_file_ext = os.path.splitext(
+                rollback_csv_file_path_tail
+            )
+            rollback_csv_file_path = os.path.join(
+                rollback_csv_file_path_head,
+                f"{rollback_csv_file_basename}.{now_string}{rollback_csv_file_ext}",
+            )
+            return os.path.abspath(rollback_csv_file_path)
+        else:
+            return os.path.abspath(config["rollback_csv_file_path"])
+    else:
+        return os.path.abspath(
+            os.path.join(
+                config["rollback_dir"] or config["input_dir"], rollback_csv_filename
+            )
+        )
 
 
-def write_rollback_config(config, path_to_rollback_csv_file):
+def get_rollback_config_filepath(config):
     if "rollback_config_filename_template" in config:
         config_filename, task_config_ext = os.path.splitext(config["config_file"])
         input_csv_filename, input_csv_ext = os.path.splitext(config["input_csv"])
@@ -8993,14 +9374,25 @@ def write_rollback_config(config, path_to_rollback_csv_file):
             config["rollback_config_filename_template"]
         )
         try:
-            rollback_config_filename_basename = str(
-                rollback_config_filename_template.substitute(
-                    {
-                        "config_filename": config_filename,
-                        "input_csv_filename": input_csv_filename,
-                    }
+            if config["task"] == "create":
+                rollback_config_filename_basename = str(
+                    rollback_config_filename_template.substitute(
+                        {
+                            "config_filename": config_filename,
+                            "input_csv_filename": input_csv_filename,
+                            "csv_start_row": str(config["csv_start_row"]),
+                            "csv_stop_row": str(config["csv_stop_row"]),
+                        }
+                    )
                 )
-            )
+            if config["task"] == "create_from_files":
+                rollback_config_filename_basename = str(
+                    rollback_config_filename_template.substitute(
+                        {
+                            "config_filename": config_filename,
+                        }
+                    )
+                )
         except Exception as e:
             # We need to account for the very common case where the user has included "valid identifier characters"
             # (as defined in https://peps.python.org/pep-0292/) as part of their template. The most common case will
@@ -9015,28 +9407,83 @@ def write_rollback_config(config, path_to_rollback_csv_file):
     else:
         rollback_config_filename_basename = "rollback"
 
-    if config["timestamp_rollback"] is True:
+    # Get workbench's current directory, to use as the default directory for the rollback config file.
+    # We only override this location if "rollback_config_file_path" is set in the config.
+    if "rollback_config_file_path" not in config:
+        rb_config_file_dir = sys.path[0]
+    else:
+        rb_config_file_dir = ""
+
+    if config["timestamp_rollback"] is True or (
+        config["recovery_mode_starting_from_node_id"] is not False
+        and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+    ):
         now_string = EXECUTION_START_TIME.strftime("%Y_%m_%d_%H_%M_%S")
-        rollback_config_filename = (
-            f"{rollback_config_filename_basename}.{now_string}.yml"
+
+    if config["timestamp_rollback"] is True:
+        rollback_config_filepath = os.path.join(
+            f"{rb_config_file_dir}",
+            f"{rollback_config_filename_basename}.{now_string}.yml",
+        )
+    elif (
+        config["recovery_mode_starting_from_node_id"] is not False
+        and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
+    ):
+        rollback_config_filepath = os.path.join(
+            f"{rb_config_file_dir}",
+            f"{rollback_config_filename_basename}.{now_string}.recovery_mode.yml",
         )
     else:
-        rollback_config_filename = f"{rollback_config_filename_basename}.yml"
+        rollback_config_filepath = os.path.join(
+            f"{rb_config_file_dir}", f"{rollback_config_filename_basename}.yml"
+        )
+
+    if (
+        "rollback_config_file_path" in config
+        and len(config["rollback_config_file_path"]) > 0
+    ):
+        if config["timestamp_rollback"] is True:
+            rollback_config_file_path_head, rollback_config_file_path_tail = (
+                os.path.split(config["rollback_config_file_path"])
+            )
+            rollback_config_file_basename, rollback_config_file_ext = os.path.splitext(
+                rollback_config_file_path_tail
+            )
+            rollback_config_file_path = os.path.join(
+                rollback_config_file_path_head,
+                f"{rollback_config_file_basename}.{now_string}{rollback_config_file_ext}",
+            )
+            return os.path.abspath(rollback_config_file_path)
+        else:
+            rollback_config_filepath = os.path.abspath(
+                config["rollback_config_file_path"]
+            )
+
+    return rollback_config_filepath
+
+
+def write_rollback_config(config, path_to_rollback_csv_file):
+    rollback_config_filename = get_rollback_config_filepath(config)
 
     logging.info(f"Writing rollback configuration file to {rollback_config_filename}.")
     rollback_config_file = open(rollback_config_filename, "w")
     rollback_comments = get_rollback_config_comments(config)
     rollback_config_file.write(rollback_comments)
 
+    if config["include_password_in_rollback_config_file"] is True:
+        password = config["password"]
+    else:
+        password = None
+
     yaml.dump(
         {
             "task": "delete",
             "host": config["host"],
             "username": config["username"],
-            "password": config["password"],
+            "password": password,
             "input_dir": config["input_dir"],
             "standalone_media_url": config["standalone_media_url"],
-            "input_csv": os.path.basename(path_to_rollback_csv_file),
+            "input_csv": path_to_rollback_csv_file,
         },
         rollback_config_file,
     )
@@ -9047,7 +9494,12 @@ def prep_rollback_csv(config, path_to_rollback_csv_file):
         if os.path.exists(path_to_rollback_csv_file):
             os.remove(path_to_rollback_csv_file)
         rollback_csv_file = open(path_to_rollback_csv_file, "a+")
-        rollback_csv_file.write("node_id" + "\n")
+        if config["rollback_file_include_node_info"] is False:
+            rollback_csv_file.write("node_id" + "\n")
+        else:
+            rollback_csv_file.write(
+                f"node_id,{config['id_field']},title,field_member_of,file" + "\n"
+            )
         rollback_csv_comments = get_rollback_config_comments(config)
         rollback_csv_file.write(rollback_csv_comments)
         rollback_csv_file.close()
@@ -9061,10 +9513,66 @@ def prep_rollback_csv(config, path_to_rollback_csv_file):
         sys.exit("Error: " + message)
 
 
-def write_rollback_node_id(config, node_id, path_to_rollback_csv_file):
+def write_rollback_node_id(
+    config,
+    node_id,
+    id,
+    node_title,
+    node_file_path,
+    member_of,
+    path_to_rollback_csv_file,
+):
+    """Appends a row to the CSV file located at path_to_rollback_csv_file."""
+    """Parameters
+        ----------
+        config : dict
+            The configuration settings defined by workbench_config.get_config().
+        node_id : str
+            The node ID to write to the file.
+        id : str
+            The CSV ID to write to the file. Empty for pages created from directories,
+            or for files used in create_from files tasks.
+        node_title : str
+            The title of the node.
+        node_file_path : str
+            The relative path to the value of the CSV "file" column, or for page/child
+            nodes created from subdirectories, the path to the subdirectory and file.
+        member_of : str
+            The value of "field_member_of" for the node.
+        path_to_rollback_csv_file : string
+            The path to the CSV file.
+        Returns
+        -------
+        None
+    """
     path_to_rollback_csv_file = get_rollback_csv_filepath(config)
-    rollback_csv_file = open(path_to_rollback_csv_file, "a+")
-    rollback_csv_file.write(str(node_id) + "\n")
+    if config["rollback_file_include_node_info"] is False:
+        rollback_csv_file = open(path_to_rollback_csv_file, "a+")
+        rollback_csv_file.write(str(node_id) + "\n")
+    else:
+        rollback_csv_file = open(
+            path_to_rollback_csv_file, "a+", newline="", encoding="utf-8"
+        )
+        rollback_csv_writer = csv.DictWriter(
+            rollback_csv_file,
+            fieldnames=[
+                "node_id",
+                config["id_field"],
+                "title",
+                "field_member_of",
+                "file",
+            ],
+        )
+        rollback_csv_writer.writerow(
+            {
+                "node_id": node_id,
+                config["id_field"]: id,
+                "title": node_title,
+                "field_member_of": member_of,
+                "file": node_file_path,
+            }
+        )
+
     rollback_csv_file.close()
 
 
@@ -9366,8 +9874,13 @@ def check_file_exists(config, filename):
     # It's a remote file.
     if filename.startswith("http"):
         try:
+            headers = {"User-Agent": config["user_agent"]}
+
             head_response = requests.head(
-                filename, allow_redirects=True, verify=config["secure_ssl_only"]
+                filename,
+                allow_redirects=True,
+                verify=config["secure_ssl_only"],
+                headers=headers,
             )
             if head_response.status_code == 200:
                 return True
@@ -9589,6 +10102,8 @@ def get_node_media_ids(config, node_id, media_use_tids=None):
 
 
 def download_remote_file(config, url, file_fieldname, node_csv_row, node_id):
+    headers = {"User-Agent": config["user_agent"]}
+
     sections = urllib.parse.urlparse(url)
     try:
         if config["secure_ssl_only"] is False:
@@ -9596,7 +10111,11 @@ def download_remote_file(config, url, file_fieldname, node_csv_row, node_id):
         # Do not cache the responses for downloaded files in requests_cache
         with requests_cache.disabled():
             response = requests.get(
-                url, allow_redirects=True, stream=True, verify=config["secure_ssl_only"]
+                url,
+                allow_redirects=True,
+                stream=True,
+                verify=config["secure_ssl_only"],
+                headers=headers,
             )
     except requests.exceptions.Timeout as err_timeout:
         message = (
@@ -9682,123 +10201,157 @@ def get_remote_file_extension(config, file_url):
     return extension_with_dot
 
 
-def download_file_from_drupal(config, node_id):
+def get_media_list(config, node_id, media_list=None):
+    """Retrieve media list for a node if not provided."""
+    if media_list is not None:
+        return media_list
+    media_list_url = f"{config['host']}/node/{node_id}/media?_format=json"
+    response = issue_request(config, "GET", media_list_url)
+    if response.status_code != 200:
+        logging.error(
+            f"Media list request failed for node {node_id}: {response.status_code}"
+        )
+        return None
+    try:
+        return json.loads(response.text)
+    except json.decoder.JSONDecodeError as e:
+        logging.error(f"Media query for node {node_id} failed: {e}")
+        return None
+
+
+def resolve_media_use_term_id(config, media_use_term_id, node_id):
+    """Resolve media use term ID from URI or configuration."""
+    if media_use_term_id is None:
+        media_use_term_id = config.get("export_file_media_use_term_id")
+        if media_use_term_id is None:
+            logging.error(
+                f"No media use term ID provided or configured for node {node_id}."
+            )
+            return None
+    if isinstance(media_use_term_id, str) and media_use_term_id.startswith("http"):
+        term_id = get_term_id_from_uri(config, media_use_term_id)
+        if term_id is None:
+            logging.error(
+                f"Failed to convert URI {media_use_term_id} to term ID for node {node_id}."
+            )
+            return None
+        return term_id
+    return media_use_term_id
+
+
+def find_file_url_in_media(config, media_list, media_use_term_id, node_id):
+    """Find the file URL in media entries matching the use term."""
+    for media in media_list:
+        for file_field in file_fields:
+            if file_field in media:
+                media_use_terms = media.get("field_media_use", [])
+                media_use_ids = [term.get("target_id") for term in media_use_terms]
+                if media_use_term_id in media_use_ids:
+                    file_info = media[file_field]
+                    if len(file_info) > 0:
+                        file_url = file_info[0].get("url")
+                        if file_url:
+                            return file_url
+    logging.debug(
+        f"No valid media found for node {node_id} with use term {media_use_term_id}"
+    )
+    return None
+
+
+def get_media_file_url(config, node_id, media_use_term_id=None, media_list=None):
+    """Retrieve and validate the URL of a media file from Drupal."""
+    media_list = get_media_list(config, node_id, media_list)
+    if media_list is None:
+        return False
+
+    resolved_term_id = resolve_media_use_term_id(config, media_use_term_id, node_id)
+    if resolved_term_id is None:
+        return False
+
+    file_url = find_file_url_in_media(config, media_list, resolved_term_id, node_id)
+    if not file_url:
+        return False
+
+    try:
+        head_response = requests.head(
+            file_url,
+            allow_redirects=True,
+            verify=config["secure_ssl_only"],
+            timeout=10,
+        )
+        if head_response.status_code != 200:
+            logging.error(
+                f"URL validation failed for node {node_id}: {file_url} (HTTP {head_response.status_code})"
+            )
+            return False
+    except Exception as e:
+        logging.error(f"HEAD request failed for {file_url}: {str(e)}")
+        return False
+
+    logging.info(f"URL validated for node {node_id}: {file_url}")
+    return file_url
+
+
+def download_file_from_drupal(config, node_id, media_use_term_id=None, media_list=None):
     """Download a media file from Drupal."""
-    """Parameters
-        ----------
-        config : dict
-            The configuration settings defined by workbench_config.get_config().
-        node_id : string
-            The ID of the node to delete media from.
-        Returns
-        -------
-        file_name
-            The downloaded file's name, or False if unable to download the file.
-    """
-    if config["export_file_directory"] is None:
+    if config.get("export_file_directory") is None:
+        logging.error("export_file_directory is not configured")
         return False
 
     if not os.path.exists(config["export_file_directory"]):
         try:
             os.mkdir(config["export_file_directory"])
         except Exception as e:
-            message = (
-                'Path in configuration option "export_file_directory" ("'
-                + config["export_file_directory"]
-                + '") is not writable.'
-            )
-            logging.error(message + " " + str(e))
+            message = f'Path "export_file_directory" ("{config["export_file_directory"]}") is not writable: {str(e)}'
+            logging.error(message)
             sys.exit("Error: " + message + " See log for more detail.")
     else:
-        message = (
-            'Path in configuration option "export_file_directory" ("'
-            + config["export_file_directory"]
-            + '") already exists.'
+        logging.info(
+            f'Path "export_file_directory" ("{config["export_file_directory"]}") already exists.'
         )
-        logging.info(message)
 
-    media_list_url = f"{config['host']}/node/{node_id}/media?_format=json"
-    media_list_response = issue_request(config, "GET", media_list_url)
-    if media_list_response.status_code == 200:
-        try:
-            media_list = json.loads(media_list_response.text)
-        except json.decoder.JSONDecodeError as e:
-            logging.error(
-                f"Media query for node {node_id} produced the following error: {e}"
+    media_list = get_media_list(config, node_id, media_list)
+    if media_list is None:
+        return False
+
+    resolved_term_id = resolve_media_use_term_id(config, media_use_term_id, node_id)
+    if resolved_term_id is None:
+        return False
+
+    file_url = find_file_url_in_media(config, media_list, resolved_term_id, node_id)
+    if not file_url:
+        return False
+
+    url_filename = os.path.basename(file_url)
+    downloaded_file_path = os.path.join(config["export_file_directory"], url_filename)
+    if os.path.exists(downloaded_file_path):
+        downloaded_file_path = get_deduped_file_path(downloaded_file_path)
+
+    try:
+        with open(downloaded_file_path, "wb+") as f:
+            file_download_response = requests.get(
+                file_url,
+                allow_redirects=True,
+                verify=config["secure_ssl_only"],
             )
-            return False
-        if len(media_list) == 0:
-            logging.warning(f"Node {node_id} has no media.")
-            return False
-
-        if str(config["export_file_media_use_term_id"]).startswith("http"):
-            config["export_file_media_use_term_id"] = get_term_id_from_uri(
-                config, config["export_file_media_use_term_id"]
-            )
-
-        if config["export_file_media_use_term_id"] is False:
-            logging.error(
-                f'Unknown value for configuration setting "export_file_media_use_term_id": {config["export_file_media_use_term_id"]}.'
-            )
-            return False
-
-        for media in media_list:
-            for file_field_name in file_fields:
-                if file_field_name in media:
-                    if (
-                        len(media[file_field_name])
-                        and media["field_media_use"][0]["target_id"]
-                        == config["export_file_media_use_term_id"]
-                    ):
-                        url_filename = os.path.basename(
-                            media[file_field_name][0]["url"]
-                        )
-                        downloaded_file_path = os.path.join(
-                            config["export_file_directory"], url_filename
-                        )
-                        if os.path.exists(downloaded_file_path):
-                            downloaded_file_path = get_deduped_file_path(
-                                downloaded_file_path
-                            )
-                        f = open(downloaded_file_path, "wb+")
-                        # User needs to be anonymous since authenticated users are getting 403 responses. Probably something in
-                        # Drupal's FileAccessControlHandler code is doing this.
-                        file_download_response = requests.get(
-                            media[file_field_name][0]["url"],
-                            allow_redirects=True,
-                            verify=config["secure_ssl_only"],
-                        )
-                        if file_download_response.status_code == 200:
-                            f.write(file_download_response.content)
-                            f.close()
-                            filename_for_logging = os.path.basename(
-                                downloaded_file_path
-                            )
-                            logging.info(
-                                f'File "{filename_for_logging}" downloaded for node {node_id}.'
-                            )
-                            if os.path.isabs(config["export_file_directory"]):
-                                return downloaded_file_path
-                            else:
-                                return filename_for_logging
-                        else:
-                            message = (
-                                f"File at {media[file_field_name][0]['url']} (part of media for node {node_id}) could "
-                                + f"not be downloaded (HTTP response code {file_download_response.status_code})."
-                            )
-                            logging.error(message)
-                            return False
-                    else:
-                        logging.warning(
-                            f'Node {node_id} in new Summit has no files in "{file_field_name}".'
-                        )
-                        return False
-                else:
-                    continue
-    else:
-        logging.error(
-            f"Attempt to fetch media list {media_list_url} returned an {media_list_response.status_code} HTTP response."
-        )
+            if file_download_response.status_code == 200:
+                f.write(file_download_response.content)
+                filename_for_logging = os.path.basename(downloaded_file_path)
+                logging.info(
+                    f'File "{filename_for_logging}" downloaded for node {node_id}.'
+                )
+                return (
+                    downloaded_file_path
+                    if os.path.isabs(config["export_file_directory"])
+                    else filename_for_logging
+                )
+            else:
+                logging.error(
+                    f"File download failed for node {node_id}: {file_url} (HTTP {file_download_response.status_code})"
+                )
+                return False
+    except Exception as e:
+        logging.error(f"File download failed for node {node_id}: {str(e)}")
         return False
 
 
@@ -10114,7 +10667,7 @@ def get_page_title_from_template(config, parent_title, weight):
 
 
 def apply_csv_value_templates(config, template_config_setting, row):
-    """Applies a simple template to a CSV value. Template variables availalbe are: $csv_value, $file,
+    """Applies templates to values in a CSV row. Template variables available are: $csv_value, $file,
     $filename_without_extension, $weight, $random_alphanumeric_string, $random_number_string, and
     $uuid_string.
     """
@@ -10126,7 +10679,8 @@ def apply_csv_value_templates(config, template_config_setting, row):
             The config setting to get the templates from. One of 'csv_value_templates' or
             'csv_value_templates_for_paged_content'.
         row: OrderedDict
-            A CSV row to apply the template(s) to.
+            A CSV row to apply the template(s) to. For pages/children created from subdirectories, this
+            is a version of the parent's row so we can get $csv_value values for non-required fields.
         Returns
         -------
         dict
@@ -10188,25 +10742,48 @@ def apply_csv_value_templates(config, template_config_setting, row):
                     )
                     outgoing_subvalues.append(subvalue)
 
-                if (
-                    len(row[field]) == 0
-                    and field in config["allow_csv_value_templates_if_field_empty"]
-                ):
-                    field_template = string.Template(templates[field])
-                    subvalue = str(
-                        field_template.substitute(
-                            {
-                                "csv_value": subvalue,
-                                "file": row_file_value,
-                                "filename_without_extension": filename_without_extension,
-                                "weight": weight,
-                                "random_alphanumeric_string": alphanumeric_string,
-                                "random_number_string": number_string,
-                                "uuid_string": uuid_string,
-                            }
+                # Handle empty CSV values, first for parent-level items and then for page/child items from
+                # subdirectories (which will always have empty CSV values except for required fields).
+                if len(row[field]) == 0:
+                    if (
+                        template_config_setting == "csv_value_templates"
+                        and field in config["allow_csv_value_templates_if_field_empty"]
+                    ):
+                        field_template = string.Template(templates[field])
+                        subvalue = str(
+                            field_template.substitute(
+                                {
+                                    "csv_value": subvalue,
+                                    "file": row_file_value,
+                                    "filename_without_extension": filename_without_extension,
+                                    "weight": weight,
+                                    "random_alphanumeric_string": alphanumeric_string,
+                                    "random_number_string": number_string,
+                                    "uuid_string": uuid_string,
+                                }
+                            )
                         )
-                    )
-                    outgoing_subvalues.append(subvalue)
+                        outgoing_subvalues.append(subvalue)
+
+                    if (
+                        template_config_setting
+                        == "csv_value_templates_for_paged_content"
+                    ):
+                        field_template = string.Template(templates[field])
+                        subvalue = str(
+                            field_template.substitute(
+                                {
+                                    "csv_value": subvalue,
+                                    "file": row_file_value,
+                                    "filename_without_extension": filename_without_extension,
+                                    "weight": weight,
+                                    "random_alphanumeric_string": alphanumeric_string,
+                                    "random_number_string": number_string,
+                                    "uuid_string": uuid_string,
+                                }
+                            )
+                        )
+                        outgoing_subvalues.append(subvalue)
 
             templated_string = config["subdelimiter"].join(outgoing_subvalues)
             row[field] = templated_string
@@ -10288,12 +10865,16 @@ def csv_subset_warning(config):
     """Create a message indicating that the csv_start_row and csv_stop_row config
     options are present and that a subset of the input CSV will be used.
     """
+    csv_data = list(get_csv_data(config))
+    start_row_id = csv_data[0][config["id_field"]]
+    stop_row_id = csv_data[-1][config["id_field"]]
+
     if config["csv_start_row"] != 0 or config["csv_stop_row"] is not None:
-        message = f"Using a subset of the input CSV (will start at row {config['csv_start_row']}, stop at row {config['csv_stop_row']})."
+        message = f"Using a subset of the input CSV (will start at row {config['csv_start_row']} / row ID \"{start_row_id}\", stop at row {config['csv_stop_row']} / row ID \"{stop_row_id}\")."
         if config["csv_start_row"] != 0 and config["csv_stop_row"] is None:
-            message = f"Using a subset of the input CSV (will start at row {config['csv_start_row']})."
+            message = f"Using a subset of the input CSV (will start at row {config['csv_start_row']} / row ID {start_row_id})."
         if config["csv_start_row"] == 0 and config["csv_stop_row"] is not None:
-            message = f"Using a subset of the input CSV (will stop at row {config['csv_stop_row']})."
+            message = f"Using a subset of the input CSV (will stop at row {config['csv_stop_row']} / row ID {stop_row_id})."
         print(message)
         logging.info(message)
 
@@ -10996,19 +11577,15 @@ def sqlite_manager(
         return False
 
     if db_file_path is None:
-        db_file_name = config["sqlite_db_filename"]
-    else:
-        db_file_name = db_file_path
+        db_file_path = config["sqlite_db_filename"]
 
-    if os.path.isabs(db_file_name):
-        db_path = db_file_name
-    else:
-        db_path = os.path.join(config["temp_dir"], db_file_name)
+    db_path = os.path.abspath(db_file_path)
 
     # Only create the database if the database file does not exist. Note: Sqlite3 creates the db file
     # automatically in its .connect method, so you only need to use this operation if you want to
     # create the db prior to creating a table. No need to use it as a prerequisite for creating a table.
     if operation == "create_database":
+        # Already exists and is a file (assumes it's an SQLite database file).
         if os.path.isfile(db_path):
             return False
         else:
@@ -11029,7 +11606,6 @@ def sqlite_manager(
         ).fetchall()
         # Only create the table if it doesn't exist.
         if tables == []:
-            # cur = con.cursor()
             res = cur.execute(query)
             con.close()
             return res
@@ -11044,6 +11620,7 @@ def sqlite_manager(
         try:
             con = sqlite3.connect(db_path)
             con.row_factory = sqlite3.Row
+            # con.set_trace_callback(print)
             cur = con.cursor()
             res = cur.execute(query, values).fetchall()
             con.close()
@@ -11074,10 +11651,12 @@ def prepare_csv_id_to_node_id_map(config):
     """Creates the SQLite database used to map CSV row IDs to newly create node IDs."""
     if config["csv_id_to_node_id_map_path"] is False:
         return None
+
     create_table_sql = (
         "CREATE TABLE csv_id_to_node_id_map (timestamp TIMESTAMP DEFAULT (datetime('now','localtime')) NOT NULL, "
         + " config_file TEXT, parent_csv_id TEXT, parent_node_id, csv_id TEXT, node_id TEXT)"
     )
+
     sqlite_manager(
         config,
         operation="create_table",
@@ -11107,6 +11686,60 @@ def populate_csv_id_to_node_id_map(
         ),
         db_file_path=config["csv_id_to_node_id_map_path"],
     )
+
+
+def recovery_mode_id_in_csv_id_to_node_id_map(config, csv_id, parent_csv_id=None):
+    """Query the CSV ID to node ID map to check for a CSV ID, or in the case of pages/children
+       in directories, for the filename. Used only during recovery mode.
+
+       Note: If the CSV ID / filename exists in more than one row, only the most
+       recent corresponding node ID is returned.
+
+    Params
+    ----------
+        config : dict
+            The configuration settings defined by workbench_config.get_config().
+        csv_id : string
+            The ID from the input CSV, or in the case of pages/children in directories, the
+            filename.
+        parent_csv_id: None|string
+            The parent ID, used only for pages/children in directories to disambiguate
+            non-unique filenames across directories processed during the same job.
+    Return
+    ------
+        bool|str
+            The item's node_id if the item is in the map, False if not.
+    """
+    # Confirm the database exists; if not, tell the user and exit.
+    if config["csv_id_to_node_id_map_path"] is not False:
+        if not os.path.exists(config["csv_id_to_node_id_map_path"]):
+            message = f"Can't find CSV ID to node ID database at {config['csv_id_to_node_id_map_path']}."
+            logging.error(message)
+            sys.exit("Error: " + message)
+
+    # If database exists, query it. Ordering desc by timestamp will get us the latest row if more
+    # than one row meets the other criteria. "+ 0" casts the node_id column value as an integer.
+    if parent_csv_id is None:
+        query = "select node_id from csv_id_to_node_id_map where csv_id = ? and node_id + 0 >= ? order by timestamp desc limit 1"
+        values = (csv_id, int(config["recovery_mode_starting_from_node_id"]))
+    else:
+        query = "select node_id from csv_id_to_node_id_map where parent_csv_id = ? and csv_id = ? and node_id + 0 >= ? order by timestamp desc limit 1"
+        values = (
+            parent_csv_id,
+            csv_id,
+            int(config["recovery_mode_starting_from_node_id"]),
+        )
+    csv_id_map_result = sqlite_manager(
+        config,
+        operation="select",
+        query=query,
+        values=values,
+        db_file_path=config["csv_id_to_node_id_map_path"],
+    )
+    if len(csv_id_map_result) > 0:
+        return str(csv_id_map_result[0][0])
+    else:
+        return False
 
 
 def get_term_field_values(config, term_id):
