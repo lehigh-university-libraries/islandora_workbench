@@ -222,6 +222,7 @@ def create():
             # in the "Assemble Drupal field structures..." section below.
             row["promote"] = ""
 
+
         if "field_member_of" in row.keys() and (len(row["field_member_of"]) > 0):
             # First split out subvalues.
             field_member_of_values = []
