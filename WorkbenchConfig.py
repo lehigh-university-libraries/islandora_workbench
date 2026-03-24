@@ -150,7 +150,7 @@ class WorkbenchConfig:
             {"image": ["png", "gif", "jpg", "jpeg"]},
             {"document": ["pdf", "doc", "docx", "ppt", "pptx"]},
             {"file": ["tif", "tiff", "jp2", "zip", "tar"]},
-            {"audio": ["mp3", "wav", "aac"]},
+            {"audio": ["mp3", "wav", "aac", "flac"]},
             {
                 "video": [
                     "mp4",
