@@ -1,7 +1,15 @@
 """unittest tests that do not require a live Drupal."""
 
+import argparse
+import contextlib
+import io
 import sys
 import os
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+
+import requests
 from ruamel.yaml import YAML
 import collections
 import tempfile
@@ -9,6 +17,7 @@ import unittest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import workbench_utils
+from WorkbenchConfig import WorkbenchConfig
 
 
 class TestCompareStings(unittest.TestCase):
@@ -656,6 +665,123 @@ class TestSetMediaType(unittest.TestCase):
         self.assertEqual(res, "barmediatype")
 
 
+class TestGetFieldViewerOverrideFromConditio(unittest.TestCase):
+
+    def setUp(self):
+        yaml = YAML()
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+
+        # Overrides by extension.
+        extensions_config_file_path = os.path.join(
+            dir_path,
+            "assets",
+            "get_field_viewer_override_from_condition_test",
+            "field_viewer_override_extensions.yml",
+        )
+        with open(extensions_config_file_path, "r") as f:
+            extensions_config_file_contents = f.read()
+        self.extensions_config_yaml = yaml.load(extensions_config_file_contents)
+
+        # Overrides by model.
+        models_config_file_path = os.path.join(
+            dir_path,
+            "assets",
+            "get_field_viewer_override_from_condition_test",
+            "field_viewer_override_models.yml",
+        )
+        with open(models_config_file_path, "r") as f:
+            models_config_file_contents = f.read()
+        self.models_config_yaml = yaml.load(models_config_file_contents)
+
+        # Overrides when both are present in config.
+        both_config_file_path = os.path.join(
+            dir_path,
+            "assets",
+            "get_field_viewer_override_from_condition_test",
+            "field_viewer_override_both.yml",
+        )
+        with open(both_config_file_path, "r") as f:
+            both_config_file_contents = f.read()
+        self.both_config_yaml = yaml.load(both_config_file_contents)
+
+    def test_overrides_by_extension(self):
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["file"] = "/tmp/foo.Tif"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.extensions_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "http://openseadragon.github.io")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["file"] = "/tmp/foo.BAR"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.extensions_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "made_up_term_name")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_viewer_override"] = "teststring"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.extensions_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "teststring")
+
+    def test_overrides_by_model(self):
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_model"] = "Digital document"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.models_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "http://mozilla.github.io/pdf.js")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_model"] = "DIGITAL DOCUMENT"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.models_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "http://mozilla.github.io/pdf.js")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_model"] = "My other custom model term name"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.models_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "MyCustomDisplayTermName")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_viewer_override"] = "MyCustomDisplayTermName"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.extensions_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "MyCustomDisplayTermName")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_viewer_override"] = "MyCUSTOMDisplayTermName"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.extensions_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "MyCUSTOMDisplayTermName")
+
+    def test_overrides_both_present(self):
+        # If both configurations for overrides are present, the one for overriding by extension pertains.
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_model"] = "Digital document"
+        fake_csv_record["file"] = "/tmp/foo.tiff"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.both_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "http://openseadragon.github.io")
+
+        fake_csv_record = collections.OrderedDict()
+        fake_csv_record["field_model"] = "Digital document"
+        fake_csv_record["file"] = "/tmp/foo.tiff"
+        fake_csv_record["field_viewer_override"] = "MyModel term name"
+        res = workbench_utils.get_field_viewer_override_from_condition(
+            self.both_config_yaml, fake_csv_record
+        )
+        self.assertEqual(res, "MyModel term name")
+
+
 class TestGetCsvFromExcel(unittest.TestCase):
     """Note: this tests the extraction of CSV data from Excel only,
     not using an Excel file as an input CSV file. That is tested
@@ -768,6 +894,26 @@ class TestSqliteManager(unittest.TestCase):
         )
         self.assertEqual(len(res), 1)
 
+    def test_add_column(self):
+        # Add a new column.
+        alter_res = workbench_utils.sqlite_manager(
+            self.config,
+            operation="alter_table",
+            db_file_path=self.db_file_path,
+            # table and column names in alter queries can't be parameterized.
+            query="alter table 'names' add column 'foo' integer",
+        )
+
+        # Then confirm the new "foo" column is in the table.
+        select_res = workbench_utils.sqlite_manager(
+            self.config,
+            operation="select",
+            db_file_path=self.db_file_path,
+            query="select * from pragma_table_info(?)",
+            values=("names",),
+        )
+        self.assertEqual(select_res[2][1], "foo")
+
     def tearDown(self):
         os.remove(self.db_file_path)
 
@@ -822,6 +968,23 @@ class TestIntegrationModuleVersionNumbers(unittest.TestCase):
             res = version_number >= minimum_version
             self.assertTrue(
                 res, "Version number " + str(version_number) + " is less than 1.0."
+            )
+
+        minimum_version = tuple([1, 2])
+        lower_versions = ["0.9", "0.8", "0.8.0-dev", "1.0.0", "1.0.1", "1.1", "1.1.9"]
+        for version in lower_versions:
+            version_number = workbench_utils.convert_semver_to_number(version)
+            res = version_number < minimum_version
+            self.assertTrue(
+                res, "Version number " + str(version_number) + " is greater than 1.2."
+            )
+
+        higher_versions = ["1.2.1", "1.3.0", "10.0"]
+        for version in higher_versions:
+            version_number = workbench_utils.convert_semver_to_number(version)
+            res = version_number >= minimum_version
+            self.assertTrue(
+                res, "Version number " + str(version_number) + " is less than 1.2."
             )
 
 
@@ -967,6 +1130,28 @@ class TestCleanCsvValues(unittest.TestCase):
 
         csv_record = workbench_utils.clean_csv_values(config, csv_record)
         self.assertEqual(clean_csv_record, csv_record)
+
+
+class TestValidateWeightValue(unittest.TestCase):
+
+    def test_validate_weight_values(self):
+        res = workbench_utils.validate_weight_value("002")
+        self.assertTrue(res)
+
+        res = workbench_utils.validate_weight_value("100")
+        self.assertTrue(res)
+
+        res = workbench_utils.validate_media_track_value("004a")
+        self.assertFalse(res)
+
+        res = workbench_utils.validate_media_track_value("-500")
+        self.assertFalse(res)
+
+        res = workbench_utils.validate_media_track_value("_200")
+        self.assertFalse(res)
+
+        res = workbench_utils.validate_media_track_value("page1")
+        self.assertFalse(res)
 
 
 class TestGetPageTitleFromTemplate(unittest.TestCase):
@@ -1632,6 +1817,386 @@ class TestFileIsUtf8(unittest.TestCase):
                         os.path.join(input_files_dir, file_to_test)
                     )
                     self.assertEqual(is_utf8, False)
+
+
+class TestGetCsvIdToNodeIdMapAllowedHostsSql(unittest.TestCase):
+    def test_empty_csv_id_to_node_id_map_allowed_hosts(self):
+        self.config = {
+            "csv_id_to_node_id_map_allowed_hosts": [],
+            "host": "https://localhost",
+        }
+        sql_snippet = workbench_utils.get_csv_id_to_node_id_map_allowed_hosts_sql(
+            self.config
+        )
+        self.assertEqual(sql_snippet, "")
+
+    def test_default_csv_id_to_node_id_map_allowed_hosts(self):
+        # We're using localhost here as an example default; the actual default value
+        # of csv_id_to_node_id_map_allowed_hosts is an empty host value ("") and the
+        # value of the current "host" config setting.
+        self.config = {
+            "csv_id_to_node_id_map_allowed_hosts": ["", "https://localhost"],
+            "host": "https://localhost",
+        }
+        sql_snippet = workbench_utils.get_csv_id_to_node_id_map_allowed_hosts_sql(
+            self.config
+        )
+        self.assertEqual(
+            sql_snippet, ' host is null or  host in ("https://localhost") and '
+        )
+
+    def test_multiple_hosts_csv_id_to_node_id_map_allowed_hosts(self):
+        self.config = {
+            "csv_id_to_node_id_map_allowed_hosts": [
+                "",
+                "https://localhost",
+                "https://localhost-test",
+            ],
+            "host": "https://localhost-test",
+        }
+        sql_snippet = workbench_utils.get_csv_id_to_node_id_map_allowed_hosts_sql(
+            self.config
+        )
+        self.assertEqual(
+            sql_snippet,
+            ' host is null or  host in ("https://localhost","https://localhost-test") and ',
+        )
+
+    def test_no_empty_csv_id_to_node_id_map_allowed_hosts(self):
+        self.config = {
+            "csv_id_to_node_id_map_allowed_hosts": ["https://localhost"],
+            "host": "https://localhost",
+        }
+        sql_snippet = workbench_utils.get_csv_id_to_node_id_map_allowed_hosts_sql(
+            self.config
+        )
+        self.assertEqual(sql_snippet, '  host in ("https://localhost") and ')
+
+
+class TestPagedContentIgnoreFile(unittest.TestCase):
+    def test_full_filenames(self):
+        config = {"paged_content_ignore_files": ["Thumbs.db", "foo.bar"]}
+        res = workbench_utils.paged_content_ignore_file(config, "thumbs.db")
+        self.assertTrue(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "Pagefile-001.tif")
+        self.assertFalse(res)
+
+    def test_extension_is_wildcard(self):
+        config = {
+            "paged_content_ignore_files": [
+                "Thumbs.db",
+                "foo.bar",
+                "manifest.part.*",
+                "cache.*",
+            ]
+        }
+        res = workbench_utils.paged_content_ignore_file(config, "manifest.part.xml")
+        self.assertTrue(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "manifest.part")
+        self.assertFalse(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "foo.xml")
+        self.assertFalse(res)
+
+    def test_filename_is_wildcard(self):
+        config = {
+            "paged_content_ignore_files": [
+                "Thumbs.db",
+                "foo.bar",
+                "manifest.*",
+                "cache.*",
+                "*.txt",
+                "*.cache",
+            ]
+        }
+        res = workbench_utils.paged_content_ignore_file(config, "xxx.tXt")
+        self.assertTrue(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "xxx.foo.txt")
+        self.assertTrue(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "xxx.cache")
+        self.assertTrue(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "xxx.fcache")
+        self.assertFalse(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "xxx.xt")
+        self.assertFalse(res)
+
+        res = workbench_utils.paged_content_ignore_file(config, "foo.xml")
+        self.assertFalse(res)
+
+
+def mocked_requests_get(*args, **kwargs):
+    # To handle both requests.get(url) and requests.sessions.Session.get(self, url)
+    if "url" in kwargs:
+        url = kwargs["url"]
+    elif args:
+        url = args[-1]
+    else:
+        url = None
+
+    class MockResponse:
+        def __init__(self, json_data, status_code):
+            self.json_data = json_data
+            self.status_code = status_code
+            self.elapsed = timedelta(seconds=0.1)
+
+        def json(self):
+            return self.json_data
+
+        def text(self):
+            return str(self.json_data)
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"Received status code {self.status_code}")
+
+    if url == "https://example.com/test_file.txt":
+        return MockResponse(None, 200)
+    elif (
+        url
+        == "https://example.com/entity/entity_form_display/node.islandora_object.default?_format=json"
+    ):
+        return MockResponse(
+            {
+                "type": "islandora_object",
+                "name": "Islandora Object",
+                "dependencies": {
+                    "config": ["field.field.node.islandora_object.field_file"]
+                },
+            },
+            200,
+        )
+    elif url == "https://example.com/islandora_workbench_integration/version":
+        return MockResponse({"integration_module_version": "1.0.0"}, 200)
+    elif url == "https://example.com/node/123?_format=json":
+        return MockResponse(
+            {},
+            200,
+        )
+    else:
+        return MockResponse(None, 404)
+
+
+class TestGeneralTests(unittest.TestCase):
+
+    base_config = {}
+    base_config_object = None
+    config_file_name = ""
+
+    @classmethod
+    def setUpClass(cls):
+        """Sets up a WorkbenchConfig object with a temporary config file for testing and a patch to
+        handle calls to verify the 'host' URL."""
+        cls.get_patcher = mock.patch(
+            "WorkbenchConfig.requests.sessions.Session.get",
+            side_effect=mocked_requests_get,
+        )
+        cls.get_patcher.start()
+        cls.head_patcher = mock.patch(
+            "WorkbenchConfig.requests.sessions.Session.head",
+            side_effect=mocked_requests_get,
+        )
+        cls.head_patcher.start()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w+", delete=False, suffix=".yml"
+        ) as temp_file:
+            temp_file.write(
+                "username: user\npassword: secret\ntask: create\nfield_file: file\nhost: https://example.com\n"
+            )
+            temp_file.flush()
+            cls.config_file_name = temp_file.name
+        cls.base_config_object = WorkbenchConfig(
+            argparse.Namespace(
+                config=cls.config_file_name, check=False, get_csv_template=False
+            )
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        """Stops the patcher and removes the temporary config file."""
+        cls.get_patcher.stop()
+        cls.head_patcher.stop()
+        if os.path.exists(cls.config_file_name):
+            os.remove(cls.config_file_name)
+
+    def setUp(self):
+        """Sets up a fresh base config dictionary for each test."""
+        self.base_config = self.base_config_object.get_config()
+
+    def test_node_only(self):
+        """Tests that create_file returns None if nodes_only is set in config."""
+        self.base_config["nodes_only"] = True
+        res = workbench_utils.create_file(
+            self.base_config,
+            "/some/filename.txt",
+            "field_file",
+            collections.OrderedDict({}),
+            "123",
+        )
+        self.assertIsNone(res)
+
+    def test_field_field_is_zero_length_string(self):
+        """Tests that create_file returns None if the file field is a zero-length string."""
+        csv_record = collections.OrderedDict()
+        csv_record["field_file"] = ""
+        res = workbench_utils.create_file(
+            self.base_config,
+            "/some/filename.txt",
+            "field_file",
+            csv_record,
+            "123",
+        )
+        self.assertIsNone(res)
+
+    @mock.patch("workbench_utils.requests.get", side_effect=mocked_requests_get)
+    def test_file_field_remote_404(self, mock_get_requests):
+        """Tests that create_file returns False if the remote file returns 404."""
+        csv_record = collections.OrderedDict()
+        csv_record["field_file"] = "test_file_missing.txt"
+        csv_record["id"] = "123"
+        res = workbench_utils.create_file(
+            self.base_config,
+            "https://example.com/test_file_missing.txt",
+            "field_file",
+            csv_record,
+            "123",
+        )
+        self.assertFalse(res)
+
+    def test_file_field_isabs_not_exist(self):
+        """Tests that create_file returns False if the file does not exist with absolute filename."""
+        csv_record = collections.OrderedDict()
+        csv_record["field_file"] = "/some/nonexistent/filename.txt"
+        csv_record["id"] = "123"
+        res = workbench_utils.create_file(
+            self.base_config,
+            "/some/nonexistent/filename.txt",
+            "field_file",
+            csv_record,
+            "123",
+        )
+        self.assertFalse(res)
+
+    def test_file_field_file_not_exists(self):
+        """Tests that create_file returns False if the file does not exist with relative filename."""
+        csv_record = collections.OrderedDict()
+        csv_record["field_file"] = "relative/nonexistent/filename.txt"
+        csv_record["id"] = "123"
+        res = workbench_utils.create_file(
+            self.base_config,
+            "relative/nonexistent/filename.txt",
+            "field_file",
+            csv_record,
+            "123",
+        )
+        self.assertFalse(res)
+
+    def test_set_media_type_defined(self):
+        """Tests that set_media_type returns the media_type defined in config."""
+        csv_record = collections.OrderedDict()
+        csv_record["id"] = "123"
+        self.base_config["media_type"] = "json"
+        res = workbench_utils.set_media_type(
+            self.base_config,
+            self.config_file_name,
+            "field_file",
+            csv_record,
+        )
+        self.assertEqual("json", res)
+
+    def test_set_media_type_undefined(self):
+        """Tests that set_media_type returns 'file' if media_type is not defined in config."""
+        csv_record = collections.OrderedDict()
+        res = workbench_utils.set_media_type(
+            self.base_config,
+            self.config_file_name,
+            "field_file",
+            csv_record,
+        )
+        self.assertEqual("file", res)
+
+    def test_get_file_hash(self):
+        """Tests that get_file_hash_from_local works for various hash types."""
+        expected_hashes = {
+            "md5": "fddb67fa7c2b1680dce58526997efea4",
+            "sha1": "c005f2fc4517bedbe536d22020d53f9d1dce75ac",
+            "sha256": "c8f14c1165e04eb472bbd27168234995449d381b092c6f1d95a36df7dcbb0957",
+            "sha512": False,
+        }
+        test_file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets",
+            "user-role-permissions.txt",
+        )
+        for hash_type, expected_hash in expected_hashes.items():
+            file_hash = workbench_utils.get_file_hash_from_local(
+                {}, test_file_path, hash_type
+            )
+            self.assertEqual(expected_hash, file_hash)
+
+    def test_get_config(self):
+        """Tests that the override loop in get_config works for things previously checked individually."""
+        config_file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets",
+            "config_test",
+            "test_complex_override.yml",
+        )
+        args = argparse.Namespace(
+            config=config_file_path,
+            check=False,
+            get_csv_template=False,
+        )
+        config_object = WorkbenchConfig(args)
+        config = config_object.get_config()
+        expected_config = {
+            "username": "test_user",
+            "password": "test_password",
+            "host": "https://example.com",
+            "preprocessors": [
+                {
+                    "field_abstract": "/some/path/to/abstract_script.py",
+                },
+                {
+                    "field_notes": "/some/path/to/notes_script.py",
+                },
+            ],
+            "csv_id_to_node_id_map_allowed_hosts": ["test.instance.url"],
+            "csv_id_to_node_id_map_dir": "/some/path/test",
+            "csv_id_to_node_id_map_filename": "allowed_hosts.db",
+            "csv_id_to_node_id_map_path": "/some/path/test/allowed_hosts.db",
+            "path_to_python": "/some/path/bin/python3",
+            "page_files_source_dir_field": "pages_directory",
+            "paged_content_page_content_type": "some_paged_content_type",
+        }
+        for key, value in expected_config.items():
+            if isinstance(value, dict):
+                self.assertDictEqual(value, config[key])
+            else:
+                self.assertEqual(value, config[key])
+
+    def test_get_config_no_paged_content_type(self):
+        """Tests that the paged_content_page_content_type defaults to 'islandora_object' if not set in config."""
+        config_file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "assets",
+            "config_test",
+            "test_minimal_config.yml",
+        )
+        args = argparse.Namespace(
+            config=config_file_path,
+            check=False,
+            get_csv_template=False,
+        )
+        config_object = WorkbenchConfig(args)
+        config = config_object.get_config()
+        self.assertEqual("islandora_object", config["paged_content_page_content_type"])
 
 
 if __name__ == "__main__":

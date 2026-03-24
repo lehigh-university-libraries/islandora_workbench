@@ -13,6 +13,7 @@ import datetime
 import argparse
 import collections
 import subprocess
+import concurrent.futures
 import requests_cache
 from progress_bar import InitBar
 from rich.console import Console
@@ -134,26 +135,35 @@ def create():
 
             # If we have gotten this far, the current row has not been created in Drupal.
             if "parent_id" in csv_column_headers and len(row["parent_id"]) > 0:
-                parent_node_id_query = "select node_id from csv_id_to_node_id_map where csv_id = ? and node_id >= ? order by timestamp desc limit 1"
+                csv_id_to_node_id_map_allowed_hosts_sql = (
+                    get_csv_id_to_node_id_map_allowed_hosts_sql(config)
+                )
+                sql_values = (
+                    row["parent_id"],
+                    config["recovery_mode_starting_from_node_id"],
+                )
+                parent_node_id_query = (
+                    "select node_id from csv_id_to_node_id_map where "
+                    + csv_id_to_node_id_map_allowed_hosts_sql
+                    + " csv_id = ? and node_id >= ? order by timestamp desc limit 1"
+                )
                 parent_in_id_map_result = sqlite_manager(
                     config,
                     operation="select",
                     query=parent_node_id_query,
-                    values=(
-                        row["parent_id"],
-                        config["recovery_mode_starting_from_node_id"],
-                    ),
+                    values=sql_values,
                     db_file_path=config["csv_id_to_node_id_map_path"],
                 )
                 if len(parent_in_id_map_result) > 0:
                     row["field_member_of"] = str(parent_in_id_map_result[0][0])
                 else:
-                    message = f'Recovery mode was unable to find the node ID for the parent CSV row "{row["parent_id"]}" in theh CSV ID to node ID map.'
+                    message = f'Recovery mode was unable to find the node ID for the parent CSV row "{row["parent_id"]}" in the CSV ID to node ID map.'
                     print("Warning: " + message)
                     logging.warning(message)
 
         if (
             "node_exists_verification_view_endpoint" in config
+            and config["paged_content_from_directories_parents_exist"] is False
             and get_node_exists_verification_view_endpoint(config) is not False
         ):
             candidate_node_id = verify_node_exists_by_key(config, copy.copy(row))
@@ -170,6 +180,16 @@ def create():
         # Create a copy of the current item's row to pass to create_media().
         row_for_media = copy.deepcopy(row)
         if config["paged_content_from_directories"] is True:
+            # Create a copy of the current item's row to pass to the
+            # create_children_from_directory function.
+            row_as_parent = copy.deepcopy(row)
+
+        if config["paged_content_from_directories_parents_exist"] is True:
+            if "field_member_of" not in csv_column_headers:
+                message = '"field_member_of" is a required column in your input CSV when using the "paged_content_from_directories_parents_exist: true" configuration setting.'
+                logging.error(message)
+                sys.exit("Error: " + message)
+
             # Create a copy of the current item's row to pass to the
             # create_children_from_directory function.
             row_as_parent = copy.deepcopy(row)
@@ -271,20 +291,30 @@ def create():
             and "parent_id" in row
             and row["parent_id"] is not None
         ):
+            csv_id_to_node_id_map_allowed_hosts_sql = (
+                get_csv_id_to_node_id_map_allowed_hosts_sql(config)
+            )
+
             parent_node_ids_from_id_map = []
             current_parent_node_id = ""
             if config["ignore_duplicate_parent_ids"] is True:
-                query = "select node_id from csv_id_to_node_id_map where csv_id = ? order by timestamp desc limit 1"
+                query = (
+                    "select node_id from csv_id_to_node_id_map where "
+                    + csv_id_to_node_id_map_allowed_hosts_sql
+                    + f' csv_id = "{row["parent_id"]}" order by timestamp desc limit 1'
+                )
             else:
-                query = "select node_id from csv_id_to_node_id_map where csv_id = ?"
+                query = (
+                    "select node_id from csv_id_to_node_id_map where"
+                    + csv_id_to_node_id_map_allowed_hosts_sql
+                    + " csv_id = ?"
+                )
             parent_in_id_map_result = sqlite_manager(
                 config,
                 operation="select",
                 query=query,
-                values=(row["parent_id"],),
                 db_file_path=config["csv_id_to_node_id_map_path"],
             )
-            parents_from_id_map = []
             for parent_in_id_map_row in parent_in_id_map_result:
                 parent_node_exists = ping_node(
                     config, parent_in_id_map_row["node_id"], warn=False
@@ -359,59 +389,10 @@ def create():
             # Assemble Drupal field structures from CSV data. If new field types are added to
             # workbench_fields.py, they need to be registered in the following if/elif/else block.
 
-            # Entity reference fields (taxonomy_term and node).
-            if field_definitions[custom_field]["field_type"] == "entity_reference":
-                entity_reference_field = workbench_fields.EntityReferenceField()
-                node = entity_reference_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
-
-            # Entity reference revision fields (paragraphs).
-            elif (
+            field = workbench_fields.WorkbenchFieldFactory.get_field_handler(
                 field_definitions[custom_field]["field_type"]
-                == "entity_reference_revisions"
-            ):
-                entity_reference_revisions_field = (
-                    workbench_fields.EntityReferenceRevisionsField()
-                )
-                node = entity_reference_revisions_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
-
-            # Typed relation fields.
-            elif field_definitions[custom_field]["field_type"] == "typed_relation":
-                typed_relation_field = workbench_fields.TypedRelationField()
-                node = typed_relation_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
-
-            # Geolocation fields.
-            elif field_definitions[custom_field]["field_type"] == "geolocation":
-                geolocation_field = workbench_fields.GeolocationField()
-                node = geolocation_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
-
-            # Link fields.
-            elif field_definitions[custom_field]["field_type"] == "link":
-                link_field = workbench_fields.LinkField()
-                node = link_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
-
-            # Authority Link fields.
-            elif field_definitions[custom_field]["field_type"] == "authority_link":
-                link_field = workbench_fields.AuthorityLinkField()
-                node = link_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
-
-            # For non-entity reference and non-typed relation fields (text, integer, boolean etc.).
-            else:
-                simple_field = workbench_fields.SimpleField()
-                node = simple_field.create(
-                    config, field_definitions, node, row, custom_field
-                )
+            )
+            node = field.create(config, field_definitions, node, row, custom_field)
 
             # If the user has configured Workbench to not query the CSV ID to node ID map,
             # use the in-session node_ids list to track and assign parent node IDs.
@@ -423,6 +404,20 @@ def create():
                             "target_type": "node_type",
                         }
                     ]
+
+        if config["paged_content_from_directories_parents_exist"] is True:
+            if ping_node(config, row["field_member_of"], warn=False) is True:
+                # Console output and logging are done in the create_children_from_directory() function.
+                create_children_from_directory(
+                    config, row_as_parent, row["field_member_of"]
+                )
+            else:
+                message = f'Node {row["field_member_of"]} identified in the "field_member_of" column in your input CSV doesn\'t exist, skipping adding children.'
+                logging.warning(message)
+                print("Warning: " + message)
+
+            # We don't want to create the parent node, it already exists.
+            continue
 
         node_headers = {"Content-Type": "application/json"}
         node_endpoint = "/node?_format=json"
@@ -624,10 +619,12 @@ def create():
                                     f'Media for "additional_files" CSV column "{additional_file_field}" in row with ID "{row[config["id_field"]]}" '
                                     + f'(node URL "{node_uri}") not created'
                                 )
-                                print(
-                                    "- " + message + ". See log for more information."
+                            if config["allow_missing_files"] is False:
+                                logging.error(message + " because CSV field is empty.")
+                            else:
+                                logging.warning(
+                                    message + " because CSV field is empty."
                                 )
-                            logging.error(message + " because CSV field is empty.")
                             continue
                         filename = row[additional_file_field].strip()
                         file_exists = check_file_exists(config, filename)
@@ -838,95 +835,17 @@ def update():
 
             # Assemble Drupal field structures from CSV data. If new field types are added to
             # workbench_fields.py, they need to be registered in the following if/elif/else block.
-
-            # Entity reference fields (taxonomy term and node).
-            if field_definitions[custom_field]["field_type"] == "entity_reference":
-                entity_reference_field = workbench_fields.EntityReferenceField()
-                node = entity_reference_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
-
-            # Entity reference revisions fields (paragraphs).
-            elif (
+            field = workbench_fields.WorkbenchFieldFactory.get_field_handler(
                 field_definitions[custom_field]["field_type"]
-                == "entity_reference_revisions"
-            ):
-                entity_reference_revisions_field = (
-                    workbench_fields.EntityReferenceRevisionsField()
-                )
-                node = entity_reference_revisions_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
-
-            # Typed relation fields (currently, only taxonomy term).
-            elif field_definitions[custom_field]["field_type"] == "typed_relation":
-                typed_relation_field = workbench_fields.TypedRelationField()
-                node = typed_relation_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
-
-            # Geolocation fields.
-            elif field_definitions[custom_field]["field_type"] == "geolocation":
-                geolocation_field = workbench_fields.GeolocationField()
-                node = geolocation_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
-
-            # Link fields.
-            elif field_definitions[custom_field]["field_type"] == "link":
-                link_field = workbench_fields.LinkField()
-                node = link_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
-
-            # Authority Link fields.
-            elif field_definitions[custom_field]["field_type"] == "authority_link":
-                link_field = workbench_fields.AuthorityLinkField()
-                node = link_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
-
-            # For non-entity reference and non-typed relation fields (text, etc.).
-            else:
-                simple_field = workbench_fields.SimpleField()
-                node = simple_field.update(
-                    config,
-                    field_definitions,
-                    node,
-                    row,
-                    custom_field,
-                    node_field_values[custom_field],
-                )
+            )
+            node = field.update(
+                config,
+                field_definitions,
+                node,
+                row,
+                custom_field,
+                node_field_values[custom_field],
+            )
 
         if node_has_all_fields is True:
             if value_is_numeric(row["node_id"]) is False:
@@ -1137,6 +1056,9 @@ def add_media():
     print(message)
     logging.info(message)
 
+    csv_data_as_list = list(get_csv_data(config))
+    num_csv_records = len(csv_data_as_list)
+
     csv_data = get_csv_data(config)
 
     row_count = 0
@@ -1144,6 +1066,8 @@ def add_media():
         # Delete expired items from request_cache before processing a row.
         if config["enable_http_cache"] is True:
             requests_cache.delete(expired=True)
+
+        row_count += 1
 
         if not value_is_numeric(row["node_id"]):
             row["node_id"] = get_nid_from_url_alias(config, row["node_id"])
@@ -1200,16 +1124,21 @@ def add_media():
                         media_use_tid_value,
                     )
                     if media_response_status_code in allowed_media_response_codes:
+                        filename_to_add = row["file"]
                         if config["progress_bar"] is False:
+                            if config["show_percentage_of_csv_input_processed"] is True:
+                                row_position = get_percentage(
+                                    row_count, num_csv_records
+                                )
+                                row_position_message = f" ({int(row_position)}%)"
+                            else:
+                                row_position_message = ""
                             print(
-                                'Media for "'
-                                + row["file"]
-                                + '" created and added to '
-                                + node_uri
+                                f'Media for "{filename_to_add}" created and added to {node_uri}{row_position_message}'
                             )
                         logging.info(
                             'Media for "%s" created and added to %s.',
-                            row["file"],
+                            filename_to_add,
                             node_uri,
                         )
                     else:
@@ -1318,13 +1247,13 @@ def add_media():
             )
 
         if config["progress_bar"] is True:
-            row_count += 1
             row_position = get_percentage(row_count, num_csv_records)
             pbar(row_position)
 
 
 def update_media() -> None:
-    """Update media from media IDs in the input CSV."""
+    """Callback for "update_media" and "update_media_from_node" tasks. Update media from media IDs (or node ID
+    if the task is "update_media_by_node") in the input CSV."""
     from typing import Optional
 
     # ========================================================= Helper functions =========================================================
@@ -1662,15 +1591,27 @@ def update_media() -> None:
 
     # TODO: Updating the media file and the name simultaneously does not work. The media takes the name of the new file and not the specified name.
 
-    message = (
-        '"Update media" ('
-        + config["update_mode"]
-        + ") task started using config file "
-        + args.config
-        + "."
-    )
-    print(message)
-    logging.info(message)
+    if config["task"] == "update_media":
+        message = (
+            '"Update media" ('
+            + config["update_mode"]
+            + ") task started using config file "
+            + args.config
+            + "."
+        )
+        print(message)
+        logging.info(message)
+
+    if config["task"] == "update_media_by_node":
+        message = (
+            '"Update media by node" ('
+            + config["update_mode"]
+            + ") task started using config file "
+            + args.config
+            + "."
+        )
+        print(message)
+        logging.info(message)
 
     csv_data = get_csv_data(config)
     csv_column_headers = csv_data.fieldnames
@@ -2010,7 +1951,13 @@ def update_media() -> None:
         for custom_field in custom_fields:
             media_has_all_fields = True
             # If media doesn't have the field, log that fact and skip updating the field.
-            reserved_fields = ["published", "url_alias", "file", "revision_log"]
+            reserved_fields = [
+                "published",
+                "url_alias",
+                "file",
+                "revision_log",
+                "node_id",
+            ]
             if (
                 custom_field not in json.loads(ping_media_result)
                 and custom_field not in reserved_fields
@@ -2034,94 +1981,17 @@ def update_media() -> None:
                 # Assemble Drupal field structures from CSV data. If new field types are added to
                 # workbench_fields.py, they need to be registered in the following if/elif/else block.
 
-                # Entity reference fields (taxonomy term and node).
-                if field_definitions[custom_field]["field_type"] == "entity_reference":
-                    entity_reference_field = workbench_fields.EntityReferenceField()
-                    patch_request_json = entity_reference_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
-
-                # Entity reference revisions fields (paragraphs).
-                elif (
+                field = workbench_fields.WorkbenchFieldFactory.get_field_handler(
                     field_definitions[custom_field]["field_type"]
-                    == "entity_reference_revisions"
-                ):
-                    entity_reference_revisions_field = (
-                        workbench_fields.EntityReferenceRevisionsField()
-                    )
-                    patch_request_json = entity_reference_revisions_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
-
-                # Typed relation fields (currently, only taxonomy term).
-                elif field_definitions[custom_field]["field_type"] == "typed_relation":
-                    typed_relation_field = workbench_fields.TypedRelationField()
-                    patch_request_json = typed_relation_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
-
-                # Geolocation fields.
-                elif field_definitions[custom_field]["field_type"] == "geolocation":
-                    geolocation_field = workbench_fields.GeolocationField()
-                    patch_request_json = geolocation_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
-
-                # Link fields.
-                elif field_definitions[custom_field]["field_type"] == "link":
-                    link_field = workbench_fields.LinkField()
-                    patch_request_json = link_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
-
-                # Authority Link fields.
-                elif field_definitions[custom_field]["field_type"] == "authority_link":
-                    link_field = workbench_fields.AuthorityLinkField()
-                    patch_request_json = link_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
-
-                # For non-entity reference and non-typed relation fields (text, etc.).
-                else:
-                    simple_field = workbench_fields.SimpleField()
-                    patch_request_json = simple_field.update(
-                        config,
-                        field_definitions,
-                        patch_request_json,
-                        row,
-                        custom_field,
-                        media_field_values[custom_field],
-                    )
+                )
+                patch_request_json = field.update(
+                    config,
+                    field_definitions,
+                    patch_request_json,
+                    row,
+                    custom_field,
+                    media_field_values[custom_field],
+                )
 
         # Before the patch requests, we delete the existing media/track files if the user wants to replace them.
         # Delete the old media file.
@@ -2680,6 +2550,120 @@ def get_media_report_from_view():
     print(message)
 
 
+def add_update_alt_text():
+    """Add or update alt text to all image-type media for a node. This function is used in
+    both "add_alt_text" and "update_alt_text" tasks."""
+    if config["task"] == "add_alt_text":
+        task_name = "Add alt text"
+    if config["task"] == "update_alt_text":
+        task_name = "Update alt text"
+    message = f'"{task_name}" task started using config file ' + args.config + "."
+    print(message)
+    logging.info(message)
+
+    csv_data_as_list = list(get_csv_data(config))
+    num_csv_records = len(csv_data_as_list)
+
+    csv_data = get_csv_data(config)
+
+    row_count = 0
+    for row in csv_data:
+        row_count += 1
+
+        if not value_is_numeric(row["node_id"]):
+            row["node_id"] = get_nid_from_url_alias(config, row["node_id"])
+
+        node_id = row["node_id"]
+
+        if row["image_alt_text"].strip() == "":
+            logging.warning(
+                f"'image_alt_text' value for row with node ID {node_id} is empty, skipping."
+            )
+            continue
+
+        node_ping_result = ping_node(config, node_id, "GET", True)
+        if node_ping_result is False:
+            if config["progress_bar"] is False:
+                message = f"Node {node_id} not found or not accessible, skipping adding alt text to image media."
+                print("Warning: " + message)
+            logging.warning(message)
+            continue
+
+        # Delete expired items from request_cache before processing a row.
+        if config["enable_http_cache"] is True:
+            requests_cache.delete(expired=True)
+
+        media_list = get_media_list(config, row["node_id"])
+
+        # Apply the alt text value to all "image" media for this node.
+        successful_additions = list()
+        failed_additions = list()
+        num_image_media = 0
+        for media in media_list:
+            if media["bundle"][0]["target_id"] == "image":
+                if config["task"] == "add_alt_text":
+                    task_verb = "added"
+                if config["task"] == "update_alt_text":
+                    task_verb = "updated"
+                    if "field_media_image" in media:
+                        existing_alt_text = media["field_media_image"][0]["alt"]
+                        if config["update_mode"] == "delete":
+                            row["image_alt_text"] = ""
+                        if config["update_mode"] == "append":
+                            row["image_alt_text"] = (
+                                existing_alt_text + " " + row["image_alt_text"]
+                            )
+                        # if config["update_mode"] == "replace":
+                        # We do nothing since the value of row["image_alt_text"] will be applied.
+                num_image_media += 1
+                media_id = media["mid"][0]["value"]
+                result = patch_image_alt_text(config, media_id, row)
+
+                alt_text = row["image_alt_text"]
+
+                if result == 200:
+                    successful_additions.append(str(media_id))
+                elif result is False:
+                    failed_additions.append(str(media_id))
+                    logging.error(
+                        f'Alt text "{alt_text}" for media ID {media_id} (node ID {node_id}) not added.'
+                    )
+                else:
+                    failed_additions.append(str(media_id))
+                    logging.error(
+                        f'Alt text "{alt_text}" for media ID {media_id} (node ID {node_id}) not added; HTTP PATCH request returned status code {result} or could not access the media.'
+                    )
+
+        if config["show_percentage_of_csv_input_processed"] is True:
+            row_position = get_percentage(row_count, num_csv_records)
+            row_position_message = f" ({int(row_position)}%)"
+        else:
+            row_position_message = ""
+
+        if num_image_media == len(successful_additions):
+            success_list_string = ", ".join(successful_additions)
+            logging.info(
+                f'Alt text "{alt_text}" for node ID {node_id} (image media IDs {success_list_string}) {task_verb}.'
+            )
+            if config["progress_bar"] is False:
+                print(
+                    f'OK, alt text "{alt_text}" for node ID {node_id} image media {task_verb}{row_position_message}.'
+                )
+        else:
+            failed_list_string = ", ".join(failed_additions)
+            logging.error(
+                f'Alt text "{alt_text}" for node ID {node_id} (image media IDs {failed_list_string}) not {task_verb}.'
+            )
+            if config["progress_bar"] is False:
+                print(
+                    f'Error: Alt text "{alt_text}" for node ID {node_id} not {task_verb}. See the log for more info{row_position_message}.'
+                )
+
+        if config["progress_bar"] is True:
+            row_position = get_percentage(row_count, num_csv_records)
+            pbar(row_position)
+
+
 def create_terms():
     """Create new terms via POST."""
     message = '"Create terms" task started using config file ' + args.config + "."
@@ -2811,11 +2795,10 @@ def create_terms():
 
 
 def update_terms():
-    """Placeholder function. See https://github.com/mjordan/islandora_workbench/issues/469 for more info."""
     """Update terms via PATCH. Note that PATCHing replaces the target field,
-       so if we are adding an additional value to a multivalued field, we need
-       to include the existing value(s) in our PATCH. The field classes take
-       care of preserving existing values in 'append' updates.
+    so if we are adding an additional value to a multivalued field, we need
+    to include the existing value(s) in our PATCH. The field classes take
+    care of preserving existing values in 'append' updates.
     """
     message = (
         '"Update Terms" ('
@@ -2964,94 +2947,17 @@ def update_terms():
             # Assemble Drupal field structures from CSV data. If new field types are added to
             # workbench_fields.py, they need to be registered in the following if/elif/else block.
 
-            # Entity reference fields (taxonomy term and node).
-            if field_definitions[custom_field]["field_type"] == "entity_reference":
-                entity_reference_field = workbench_fields.EntityReferenceField()
-                term = entity_reference_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
-
-            # Entity reference revision fields (paragraphs).
-            elif (
+            field = workbench_fields.WorkbenchFieldFactory.get_field_handler(
                 field_definitions[custom_field]["field_type"]
-                == "entity_reference_revisions"
-            ):
-                entity_reference_revisions_field = (
-                    workbench_fields.EntityReferenceRevisionsField()
-                )
-                term = entity_reference_revisions_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
-
-            # Typed relation fields (currently, only taxonomy term).
-            elif field_definitions[custom_field]["field_type"] == "typed_relation":
-                typed_relation_field = workbench_fields.TypedRelationField()
-                term = typed_relation_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
-
-            # Geolocation fields.
-            elif field_definitions[custom_field]["field_type"] == "geolocation":
-                geolocation_field = workbench_fields.GeolocationField()
-                term = geolocation_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
-
-            # Link fields.
-            elif field_definitions[custom_field]["field_type"] == "link":
-                link_field = workbench_fields.LinkField()
-                term = link_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
-
-            # Authority Link fields.
-            elif field_definitions[custom_field]["field_type"] == "authority_link":
-                link_field = workbench_fields.AuthorityLinkField()
-                term = link_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
-
-            # For non-entity reference and non-typed relation fields (text, etc.).
-            else:
-                simple_field = workbench_fields.SimpleField()
-                term = simple_field.update(
-                    config,
-                    field_definitions,
-                    term,
-                    row,
-                    custom_field,
-                    term_field_values[custom_field],
-                )
+            )
+            term = field.update(
+                config,
+                field_definitions,
+                term,
+                row,
+                custom_field,
+                term_field_values[custom_field],
+            )
 
         if term_has_all_fields is True:
             term_endpoint = (
@@ -3119,13 +3025,15 @@ def create_redirects():
 
         if len(row["redirect_source"].strip()) == 0:
             message = f"Redirect source value in input CSV row {redirect_row_count} is empty. Skipping."
-            print("Warning: " + message)
+            if config["progress_bar"] is False:
+                print("Warning: " + message)
             logging.warning(message)
             continue
 
         if len(row["redirect_target"].strip()) == 0:
             message = f"Redirect target value in input CSV row {redirect_row_count} is empty. Skipping."
-            print("Warning: " + message)
+            if config["progress_bar"] is False:
+                print("Warning: " + message)
             logging.warning(message)
             continue
 
@@ -3135,7 +3043,8 @@ def create_redirects():
                 + row["redirect_source"]
                 + '".'
             )
-            print("Warning: " + message)
+            if config["progress_bar"] is False:
+                print("Warning: " + message)
             logging.warning(message)
             continue
 
@@ -3163,7 +3072,8 @@ def create_redirects():
                 + str(is_redirect_response.status_code)
                 + "), skipping."
             )
-            print("Warning: " + message)
+            if config["progress_bar"] is False:
+                print("Warning: " + message)
             logging.warning(message)
             continue
 
@@ -3187,7 +3097,8 @@ def create_redirects():
                 + row["redirect_target"].strip()
                 + '" created.'
             )
-            print(message)
+            if config["progress_bar"] is False:
+                print(message)
             logging.info(message)
         else:
             message = (
@@ -3197,15 +3108,66 @@ def create_redirects():
                 + row["redirect_target"].strip()
                 + '" not created.'
             )
-            print("Error: " + message + " See log for more info.")
+            if config["progress_bar"] is False:
+                print("Error: " + message + " See log for more info.")
             logging.error(message + " HTTP status code: " + str(response.status_code))
 
         if config["progress_bar"] is True:
             redirect_row_position = get_percentage(redirect_row_count, num_csv_records)
             pbar(redirect_row_position)
 
-    if config["progress_bar"] is True:
-        pbar(100)
+
+def run_scripts():
+    """Run registered scripts."""
+    max_workers = int(config["run_scripts_threads"])
+    message = '"Run scripts" task started using config file ' + args.config
+    print(message + ".")
+    logging.info(f"{message} using {max_workers} thread(s).")
+
+    if config["run_scripts_entity_type"] == "node":
+        id_field = "node_id"
+    if config["run_scripts_entity_type"] == "media":
+        id_field = "media_id"
+    if config["run_scripts_entity_type"] == "term":
+        id_field = "term_id"
+
+    csv_data = get_csv_data(config)
+
+    entity_ids = []
+    for row in csv_data:
+        entity_ids.append(row[id_field])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for command in config["run_scripts"]:
+            executor_return = {
+                executor.submit(
+                    execute_script_to_run,
+                    config,
+                    command,
+                    config["run_scripts_entity_type"],
+                    entity_id,
+                ): entity_id
+                for entity_id in entity_ids
+            }
+            for script_result_from_executor in concurrent.futures.as_completed(
+                executor_return
+            ):
+                script_result = script_result_from_executor.result()
+                if script_result is None:
+                    message = f'Error: Script "{command}" execution failed. See the Workbench log for more information.'
+                    print(message)
+                else:
+                    if script_result[1] == 0:
+                        print(script_result[0])
+                        if config["run_scripts_log_script_output"] is True:
+                            logging.info(
+                                f'Script "{command}" exectuted with output: {script_result[0]}'
+                            )
+                    else:
+                        message = f'Script "{command}" execution failed with return code {script_result[1]}.'
+                        print(message)
+                        if config["run_scripts_log_script_output"] is True:
+                            logging.error(message)
 
 
 # Main program logic.
@@ -3332,6 +3294,8 @@ if args.recovery_mode_starting_from_node_id is not None:
         args.recovery_mode_starting_from_node_id
     )
 
+if args.check is True:
+    check_for_workbench_updates(config)
 
 if args.print_config is True:
     print("\nCurrent Islandora Workbench configuration, including defaults")
@@ -3437,6 +3401,20 @@ if len(config["input_data_zip_archives"]) > 0 and config["nodes_only"] is not Tr
         else:
             unzip_archive(config, input_data_zip_archive)
 
+if (
+    config["task"] == "create"
+    or config["task"] == "add_media"
+    or config["task"] == "update_media"
+    or config["task"] == "update_media_by_node"
+):
+    if (
+        config["nodes_only"] is False
+        and config["keep_filename_parent_directory"] is False
+    ):
+        logging.info(
+            "Parent directory names for files will not be used when creating Drupal media, but the directory names will appear in Worbench messages and log entries."
+        )
+
 if "check" in config.keys():
     tasks_to_skip = ["create_from_files", "get_data_from_view"]
     if config["check"] is False and config["task"] not in tasks_to_skip:
@@ -3487,7 +3465,7 @@ logging.info(message)
 
 check_drupal_core_version(config)
 
-if config["task"] in ["create", "update"]:
+if config["task"] in ["create", "update", "add_media", "run_scripts"]:
     csv_subset_warning(config)
 
 if config["task"] in ["create", "create_from_files"]:
@@ -3498,23 +3476,40 @@ if config["task"] in ["create", "create_from_files"]:
         config["recovery_mode_starting_from_node_id"] is not False
         and value_is_numeric(config["recovery_mode_starting_from_node_id"]) is True
     ):
-        query = "select * from csv_id_to_node_id_map where config_file = ?"
-        values = (config["config_file"],)
+        csv_id_to_node_id_map_allowed_hosts_sql = (
+            get_csv_id_to_node_id_map_allowed_hosts_sql(config)
+        )
+
+        query = (
+            "select * from csv_id_to_node_id_map where "
+            + csv_id_to_node_id_map_allowed_hosts_sql
+            + " config_file = ?"
+        )
         csv_id_map_result = sqlite_manager(
             config,
             operation="select",
             query=query,
-            values=values,
+            values=(config["config_file"],),
             db_file_path=config["csv_id_to_node_id_map_path"],
         )
         if len(csv_id_map_result) > 0:
             last_csv_id = str(csv_id_map_result[-1][4])
             last_node_id = str(csv_id_map_result[-1][5])
-            print(last_csv_id, "/", last_node_id)
-            in_map_message = (
-                f'Nodes for {len(csv_id_map_result)} rows in the input CSV "{config["input_csv"]}" have already been created '
-                + f'(last entry in the CSV ID to node ID map is for CSV row "{last_csv_id}" at {config["host"]}/node/{last_node_id}).'
-            )
+            if config["task"] == "create":
+                in_map_message = (
+                    f'Nodes for {len(csv_id_map_result)} rows in the input CSV "{config["input_csv"]}" have already been created '
+                    + f'(last entry in the CSV ID to node ID map is for CSV row "{last_csv_id}" at {config["host"]}/node/{last_node_id}).'
+                )
+                if config["paged_content_from_directories"] is True:
+                    in_map_message = (
+                        f'Nodes for {len(csv_id_map_result)} rows (including child pages) in the input CSV "{config["input_csv"]}" have already been created '
+                        + f'(last entry in the CSV ID to node ID map is for CSV row "{last_csv_id}" at {config["host"]}/node/{last_node_id}).'
+                    )
+            if config["task"] == "create_from_files":
+                in_map_message = (
+                    f'Nodes for {len(csv_id_map_result)} files in the input directory "{config["input_dir"]}" have already been created '
+                    + f'(last entry in the CSV ID to node ID map is for file "{last_csv_id}" at {config["host"]}/node/{last_node_id}).'
+                )
         else:
             in_map_message = f'Cannot find any entries in the CSV ID to node ID map created using the configuration file "{config["config_file"]}".'
 
@@ -3586,12 +3581,18 @@ try:
         get_media_report_from_view()
     if config["task"] == "create_terms":
         create_terms()
-    if config["task"] == "update_media":
+    if config["task"] in ["update_media", "update_media_by_node"]:
         update_media()
     if config["task"] == "update_terms":
         update_terms()
     if config["task"] == "create_redirects":
         create_redirects()
+    if config["task"] == "add_alt_text":
+        add_update_alt_text()
+    if config["task"] == "update_alt_text":
+        add_update_alt_text()
+    if config["task"] == "run_scripts":
+        run_scripts()
 
     if config["secondary_tasks"] is not None and len(config["secondary_tasks"]) > 0:
         for secondary_config_file in config["secondary_tasks"]:
