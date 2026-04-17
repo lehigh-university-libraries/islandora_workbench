@@ -309,6 +309,7 @@ class WorkbenchConfig:
                     "ogv",
                     "mpeg",
                     "m3u8",
+                    "dv",
                 ]
             },
         ]
