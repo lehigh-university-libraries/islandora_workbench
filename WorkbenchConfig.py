@@ -271,7 +271,7 @@ class WorkbenchConfig:
                     "zip",
                 ],
             },
-            {"audio": ["mp3", "wav", "aac", "flac", "mp4a"]},
+            {"audio": ["mp3", "wav", "aac", "flac", "mp4a", "m4a"]},
             {
                 "video": [
                     "m4v",
