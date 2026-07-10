@@ -401,6 +401,7 @@ class WorkbenchConfig:
                     "dbf",
                     "hocr",
                     "html",
+                    "ipynb",
                     "jp2",
                     "log",
                     "lyr",
